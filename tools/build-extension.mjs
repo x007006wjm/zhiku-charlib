@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import assert from 'node:assert/strict';
 import {applyMarkers} from './apply-markers.mjs';
 import {applyUxFixes} from './ux-fixes.mjs';
+import {applyCharLibrary} from './apply-char-lib.mjs';
 import {fileURLToPath} from 'node:url';
 process.chdir(fileURLToPath(new URL('../', import.meta.url)));
 const dir='.';
@@ -182,6 +183,8 @@ return {
 };
 `);
 s=applyUxFixes(s);
+// 角色外观库：$名字$ 展开、别名、世界书宏 {{zhiku_characters}}、开关与界面提示
+s=applyCharLibrary(s);
 const prefix=`// Generated from the full script; edit build-extension.mjs and shared-upload.js.
 export function createRuntime() {
 let stopped = false;
@@ -195,7 +198,7 @@ function clearTimeout(id) { window.clearTimeout(id); timers.delete(id); }
 `;
 fs.writeFileSync(dir+'/runtime.js',prefix+s+'\n}\n');
 fs.copyFileSync('src/index.js',dir+'/index.js');
-fs.writeFileSync(dir+'/manifest.json',JSON.stringify({display_name:'智库',loading_order:100,js:'index.js',author:'if love',version:'0.8.8',homePage:'https://github.com/ruoege49-ship-it/zhiku-tavern-helper',auto_update:true,minimum_client_version:'1.14.0',dependencies:[],hooks:{enable:'onEnable',disable:'onDisable',delete:'onDelete'}},null,2)+'\n');
+fs.writeFileSync(dir+'/manifest.json',JSON.stringify({display_name:'智库',loading_order:100,js:'index.js',author:'if love',version:'0.8.8',homePage:'https://github.com/x007006wjm/zhiku-charlib',auto_update:true,minimum_client_version:'1.14.0',dependencies:[],hooks:{enable:'onEnable',disable:'onDisable',delete:'onDelete'}},null,2)+'\n');
 fs.writeFileSync(dir+'/package.json',JSON.stringify({name:'zhiku-tavern-helper',version:'0.8.8',private:true,type:'module'},null,2)+'\n');
 fs.writeFileSync(dir+'/capability-contract.json',JSON.stringify({schemaVersion:1,minimum:{sillytavern:'1.14.0',tavernHelper:null},requirements:[{id:'host-context',owner:'sillytavern',symbol:'SillyTavern.getContext',required:true,fallback:null}]},null,2));
 assert(!s.includes('getButtonEvent('));

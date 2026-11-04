@@ -3,6 +3,8 @@
 export const CHAT_IMG_PATTERN='<img\\b[^>]*(?:pc-chat-img|画师库生成)[^>]*>';
 export const MARKER_REGEX_ID = '72c57f73-46af-46ac-a28e-bf31b131332a';
 export const MARKER_DISPLAY_ID = '6ba93a8e-cabb-494c-a7e8-6c9dfcf5fb80';
+export const CHAR_BLOCK_DISPLAY_ID = 'a7c1d9b4-2f5e-4c6a-9d31-8b0f4e2a5c77';
+export const CHAR_BLOCK_RE_SOURCE = '<(?:人物|外貌变化)>[\\s\\S]*?<\\/(?:人物|外貌变化)>';
 export function escapeMarker(value) { return value.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&'); }
 export function markerPattern(start, end) { return escapeMarker(start) + '[\\s\\S]*?' + escapeMarker(end); }
 export function parseImageMarkers(text, start, end) {
@@ -15,7 +17,7 @@ export function parseImageMarkers(text, start, end) {
     }
     return result;
 }
-export function createMarkerController({context,getData,generate,upload,notify,document:doc=globalThis.document}) {
+export function createMarkerController({context,getData,generate,upload,notify,expandPrompt,document:doc=globalThis.document}) {
     let queue=Promise.resolve(), stopped=false;
     const pending=new WeakMap(), failed=new WeakMap();
     const imageBindings=new WeakSet(), overlays=new Set(), holds=new Set();
@@ -30,11 +32,13 @@ export function createMarkerController({context,getData,generate,upload,notify,d
     }
     function syncRegex() {
         const c=context(), {start,end}=settings();
-        const rule={id:MARKER_REGEX_ID,scriptName:'智库 · 生图标记不发送',findRegex:'/'+(start&&end?'(?:'+markerPattern(start,end)+')|':'')+CHAT_IMG_PATTERN+'/g',replaceString:'',trimStrings:[],placement:[1,2],disabled:false,markdownOnly:false,promptOnly:true,runOnEdit:false,substituteRegex:0,minDepth:null,maxDepth:null};
+        const block='(?:'+CHAR_BLOCK_RE_SOURCE+')';
+        const rule={id:MARKER_REGEX_ID,scriptName:'智库 · 生图标记不发送',findRegex:'/'+(start&&end?'(?:'+markerPattern(start,end)+')|':'')+block+'|'+CHAT_IMG_PATTERN+'/g',replaceString:'',trimStrings:[],placement:[1,2],disabled:false,markdownOnly:false,promptOnly:true,runOnEdit:false,substituteRegex:0,minDepth:null,maxDepth:null};
         const rules=c.extensionSettings.regex ||= [];
         const display={...rule,id:MARKER_DISPLAY_ID,scriptName:'智库 · 生图标记折叠',findRegex:start&&end?'/'+escapeMarker(start)+'(?!\\s*'+escapeMarker(end)+')[\\s\\S]*?'+escapeMarker(end)+'/g':'/(?!)/g',markdownOnly:true,promptOnly:false,replaceString:'<div class="pc-marker-slot"><details><summary>图片提示词</summary></details><button type="button" class="pc-marker-generate">生成图片</button></div>'};
+        const charBlock={...rule,id:CHAR_BLOCK_DISPLAY_ID,scriptName:'智库 · 角色档案折叠',findRegex:'/'+block+'/g',markdownOnly:true,promptOnly:false,replaceString:'<div class="pc-marker-slot pc-char-slot"><details><summary>角色档案</summary><pre>$&</pre></details></div>'};
         let changed=false;
-        for(const item of [rule,display]) {
+        for(const item of [rule,display,charBlock]) {
             const index=rules.findIndex(r=>r.id===item.id);
             if(index>=0 && JSON.stringify(rules[index])===JSON.stringify(item))continue;
             if(index<0)rules.push(item);else rules[index]=item;
@@ -187,12 +191,18 @@ export function createMarkerController({context,getData,generate,upload,notify,d
                 if(!current())return 0;
                 entry.state='生成中…';decorate(id);
                 try {
-                    const prompt=promptOverride??msg.extra?.zhikuImages?.[key]?.prompt??token.prompt;
-                    const image=await generate(prompt);if(!current())return 0;
+                    // $名字$ / JSON 标记在发给 NovelAI 之前处理（带上本楼楼层号与本标记在消息里的起始位置：本聊天库按楼层重放，<外貌变化> 按位置生效）；消息原文不动。
+                    // expandPrompt 可以返回字符串，也可以返回 { text, record }（JSON 标记用：text 是原 JSON，record 是可读提示词）。
+                    const rawPrompt=promptOverride??msg.extra?.zhikuImages?.[key]?.prompt??token.prompt;
+                    const markerMeta={msgId:Number(id),key,swipe,pos:token.index};
+                    const resolved=typeof expandPrompt==='function'?expandPrompt(rawPrompt,markerMeta):rawPrompt;
+                    const prompt=resolved&&typeof resolved==='object'&&resolved.text!==undefined?String(resolved.text):String(resolved??rawPrompt);
+                    const recordPrompt=resolved&&typeof resolved==='object'&&resolved.record!==undefined?String(resolved.record):prompt;
+                    const image=await generate(prompt,markerMeta);if(!current())return 0;
                     entry.state='保存中…';decorate(id);
                     const {url}=await upload(image,'marker_'+Date.now());if(!current())return 0;
                     if(!url)throw new Error('图片上传未返回地址');
-                    const hadExtra=!!msg.extra;msg.extra ||= {};const hadRecords=!!msg.extra.zhikuImages,records=msg.extra.zhikuImages ||= {},old=records[key];records[key]={url:String(url),prompt};
+                    const hadExtra=!!msg.extra;msg.extra ||= {};const hadRecords=!!msg.extra.zhikuImages,records=msg.extra.zhikuImages ||= {},old=records[key];records[key]={url:String(url),prompt:recordPrompt};
                     try{await c.saveChat();}catch(e){if(old)records[key]=old;else delete records[key];if(!hadRecords&&!Object.keys(records).length)delete msg.extra.zhikuImages;if(!hadExtra&&!Object.keys(msg.extra).length)delete msg.extra;throw e;}
                     failed.get(msg)?.delete(key);return 1;
                 }catch(e){let errors=failed.get(msg);if(!errors){errors=new Set();failed.set(msg,errors);}errors.add(key);notify(e.message||String(e),'error');return 0;}

@@ -87,6 +87,9 @@ function emptyData() {
             showStub: true,             // 界面上的小票根
             showChip: false,            // 输入框上方显示当前画师串
             lobbyShowNsfw: false,
+            markerCharExpand: true,   // 标记里展开 $角色名$（角色固定外貌）
+            charAutoBlocks: true,     // 从回复的 <人物>/<外貌变化> 自动建档
+            charBlockToast: true,     // 建档/改档时每楼一条小提示
         },
         lobby: { server: 'https://soundbox.192-255-236-219.sslip.io:8443/zhiku', nickname: '', invite: '' },
         characters: {},   // key -> 角色（见 chars.js）
@@ -114,6 +117,7 @@ function normalizeData(raw) {
     for (const t of Object.values(rawT)) t.shot ||= 'bust';
     d.templates = { ...structuredClone(DEFAULT_TEMPLATES), ...rawT };
     for (const a of Object.values(d.artists)) { a.images ||= []; a.note ||= ''; a.collections ||= []; a.tag = normalizeArtistTag(a.tag); }
+    for (const character of Object.values(d.characters || {})) ensureAliases(character);
     // 同一位画师存了两份的，合并成一份
     const seenA = {};
     for (const a of Object.values(d.artists)) {
@@ -1850,6 +1854,1022 @@ async function outfitFromText(name, desc, accDescs = []) {
 return { hasChinese, apiProfiles, activeApiId, currentApi, askLLM, translateToTags, pickJson, extractAppearance, textToPairs, sceneFromChat, listModels, designOutfit, outfitFromStory, designOutfitsFromChat, askVision, outfitFromImage, lookFromImage, outfitFromText };
 })();
 
+// 角色外观库：标记里的 $名字$ 展开。
+// 纯函数，不碰 DOM，也不发请求；构建时由 tools/apply-char-lib.mjs 去掉 export 后内联进 runtime.js。
+// 设计说明见 README「角色外观库」一节：
+// - 只展开 `$…$`，原文与消息里的标记保持不变，展开结果只用于发给 NovelAI 的提示词。
+// - 名字与别名按「本聊天出场角色优先，其次所有已保存角色」匹配，trim + 忽略大小写。
+// - 匹配不到时去掉 $ 保留原文，并写一行调试日志，不弹提示。
+
+/** 名字 / 别名的分隔符：| 或中英文逗号、顿号、分号、换行。 */
+const CHAR_ALIAS_SPLIT = /[|,，、;；\n]+/;
+
+/** 把 aliases 字段（数组或 "a|b" / "a,b" 字符串）整理成去重后的名字数组。 */
+function splitAliases(value) {
+    const raw = Array.isArray(value) ? value : String(value ?? '').split(CHAR_ALIAS_SPLIT);
+    const out = [];
+    for (const item of raw) {
+        const name = String(item ?? '').trim();
+        if (name && !out.includes(name)) out.push(name);
+    }
+    return out;
+}
+
+/** 原地补齐 aliases 与 nl（旧数据没有这些字段时补空值），返回同一个对象，方便直接存回。 */
+function ensureAliases(character) {
+    if (!character || typeof character !== 'object') return character;
+    const name = String(character.name ?? '').trim();
+    const aliases = splitAliases(character.aliases).filter(alias => alias !== name);
+    character.aliases = aliases;
+    character.nl = typeof character.nl === 'string' ? character.nl.trim() : '';
+    return character;
+}
+
+/** 名字 + 别名，去重、去空，第一个永远是正名。 */
+function characterNames(character) {
+    const name = String(character?.name ?? '').trim();
+    const list = [name, ...splitAliases(character?.aliases)];
+    const out = [];
+    for (const item of list) {
+        const value = String(item ?? '').trim();
+        if (value && !out.includes(value)) out.push(value);
+    }
+    return out;
+}
+
+/** 别名输入框里显示的内容：用 | 连起来（正名重复出现时剔除）。 */
+function charAliasText(character) {
+    const name = String(character?.name ?? '').trim();
+    return splitAliases(character?.aliases).filter(alias => alias !== name).join('|');
+}
+
+function normName(value) {
+    return String(value ?? '').trim().toLowerCase();
+}
+
+/** appearance / outfit.tags 这类 [{en,zh}] 列表 → 逗号分隔的英文标签串。 */
+function tagText(list) {
+    return (Array.isArray(list) ? list : [])
+        .map(item => String(item?.en ?? item ?? '').trim())
+        .filter(Boolean)
+        .join(', ');
+}
+
+function currentOutfitOf(character) {
+    const list = Array.isArray(character?.outfits) ? character.outfits : [];
+    return list.find(outfit => outfit?.id === character?.outfitId) || list[0] || null;
+}
+
+/** 这个角色固定会发的标签：外貌 + 固定衣服（outfitMode === 'fixed' 时）。 */
+function fixedTagsOf(character) {
+    const parts = [tagText(character?.appearance)];
+    if (character?.outfitMode === 'fixed') parts.push(tagText(currentOutfitOf(character)?.tags));
+    return parts.filter(Boolean).join(', ');
+}
+
+/**
+ * 名字 → 角色。顺序即优先级：先本聊天库（按楼层派生出来的那一份），
+ * 再本聊天 on 着的全局角色，最后其余全局角色；同一个名字/别名只保留最先出现的那个。
+ */
+function buildCharacterIndex(cast = [], characters = [], chatEntries = []) {
+    const index = new Map();
+    const add = character => {
+        if (!character) return;
+        for (const name of characterNames(character)) {
+            const key = normName(name);
+            if (key && !index.has(key)) index.set(key, character);
+        }
+    };
+    (Array.isArray(chatEntries) ? chatEntries : []).forEach(add);
+    (Array.isArray(cast) ? cast : []).forEach(item => {
+        if (item && item.on && item.char) add(item.char);
+    });
+    (Array.isArray(characters) ? characters : []).forEach(add);
+    return index;
+}
+
+/**
+ * 展开一段提示词里的 `$名字$`。
+ * options.chatEntries 本聊天库在该楼层的派生结果（优先）
+ * options.cast      当前聊天的 [{ key, char, on, group }]
+ * options.characters 所有已保存角色
+ * options.enabled   false 时原样返回（对应设置里的开关）
+ * options.log       匹配不到时的调试日志回调
+ */
+function expandCharacterRefs(text, { chatEntries = [], cast = [], characters = [], enabled = true, log = () => {} } = {}) {
+    const source = String(text ?? '');
+    if (!enabled || !source.includes('$')) return source;
+    const index = buildCharacterIndex(cast, characters, chatEntries);
+    return source.replace(/\$([^$\n]+)\$/g, (match, rawName) => {
+        const inner = String(rawName ?? '').trim();
+        if (!inner) return match;
+        const character = index.get(normName(inner));
+        if (!character) {
+            log(`[智库] 标记里的 $${inner}$ 没有对应角色，按普通文本发送`);
+            return inner;
+        }
+        // 角色存在但没写外貌时也退回原文，避免发出空片段。
+        return fixedTagsOf(character) || inner;
+    });
+}
+
+/**
+ * 世界书宏 {{zhiku_characters}} 的内容：一行一个本聊天开着的角色。
+ * 只给名字/别名与后缀标记（固定服装 / 全局锁定），不写「写 $名字$」——用法由世界书解释。
+ */
+function charactersMacroText(cast = [], { locked } = {}) {
+    const rows = [];
+    const seen = new Set();
+    for (const item of Array.isArray(cast) ? cast : []) {
+        if (!item || !item.on || !item.char) continue;
+        const names = characterNames(item.char);
+        const primary = names[0] || String(item.char?.name ?? '').trim();
+        if (!primary || seen.has(primary)) continue;
+        seen.add(primary);
+        const aliases = names.slice(1);
+        rows.push(`- ${primary}${aliases.length ? `（别名：${aliases.join('、')}）` : ''}${item.char.outfitMode === 'fixed' ? '[固定服装]' : ''}${locked && locked.has(primary) ? '[固定，不可改]' : ''}`);
+    }
+    return rows.join('\n');
+}
+
+// JSON 生图标记：image###{tag,nl,characters[],size}### 的解析与组装。
+// 纯函数，不碰 DOM、不发请求；构建时由 tools/apply-char-lib.mjs 去掉 export 后内联进 runtime.js。
+// 与 ST-BaiBai-Image 的协议相同，但实现是独立写的（不复制其代码）。
+// 说明：JSON 解析失败或不是对象时返回 null，调用方继续走原来的纯文本标记路径。
+
+const PUNCT_MAP = { '：': ':', '，': ',', '；': ';', '｛': '{', '｝': '}', '［': '[', '］': ']', '　': ' ' };
+
+/** 只替换字符串外的全角标点，避免破坏 JSON 字符串内容。 */
+function normalizeJsonText(input) {
+    const source = String(input ?? '');
+    let out = '';
+    let inString = false;
+    let escaped = false;
+    for (const ch of source) {
+        if (inString) {
+            out += ch;
+            if (escaped) escaped = false;
+            else if (ch === '\\') escaped = true;
+            else if (ch === '"') inString = false;
+            continue;
+        }
+        if (ch === '"') {
+            inString = true;
+            out += ch;
+            continue;
+        }
+        out += PUNCT_MAP[ch] ?? ch;
+    }
+    return out;
+}
+
+function textOf(value) {
+    return typeof value === 'string' ? value.trim() : '';
+}
+
+/** 把 JSON 对象整理成内部形状；没有可用内容时返回 null。 */
+function normalizeMarkerPayload(raw) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+    const tag = textOf(raw.tag);
+    const nl = textOf(raw.nl);
+    const sizeRaw = String(raw.size ?? '').trim().toLowerCase();
+    const size = sizeRaw === 'portrait' || sizeRaw === 'landscape' ? sizeRaw : '';
+    const characters = [];
+    if (Array.isArray(raw.characters)) {
+        for (const item of raw.characters) {
+            if (!item || typeof item !== 'object') continue;
+            const name = textOf(item.name);
+            const charTag = textOf(item.tag);
+            const charNl = textOf(item.nl);
+            if (!name || (!charTag && !charNl)) continue;
+            characters.push({ name, tag: charTag, nl: charNl });
+        }
+    }
+    if (!tag && !nl && !characters.length) return null;
+    return { tag, nl, characters, size };
+}
+
+/** 是不是结构化标记；不是就返回 null（调用方走纯文本）。 */
+function parseMarkerJson(text) {
+    const raw = String(text ?? '').trim();
+    if (!raw) return null;
+    const normalized = normalizeJsonText(raw).trim();
+    if (!normalized.startsWith('{')) return null;
+    let data;
+    try {
+        data = JSON.parse(raw);
+    } catch (error) {
+        try {
+            data = JSON.parse(normalized);
+        } catch (error2) {
+            return null;
+        }
+    }
+    return normalizeMarkerPayload(data);
+}
+
+function splitTagList(text) {
+    return String(text ?? '')
+        .split(',')
+        .map(item => item.trim())
+        .filter(Boolean);
+}
+
+function tagKey(token) {
+    return String(token ?? '').trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+function isIdentityTag(token) {
+    return /\(.+\)/.test(token);
+}
+
+function isGenderTag(token) {
+    return /^(girl|boy|1girl|1boy)$/i.test(String(token ?? '').trim());
+}
+
+/**
+ * 把库里的固定标签插进角色 tag：保留 AI 写的开头身份 tag（含括号）与性别 tag，
+ * 后面紧接库标签，再接其余 tag；大小写不敏感去重，保留先出现的。
+ */
+function injectLibraryTags(aiTag, libraryTags) {
+    const ai = splitTagList(aiTag);
+    const lib = splitTagList(libraryTags);
+    let head = 0;
+    while (head < ai.length && (isIdentityTag(ai[head]) || isGenderTag(ai[head]))) head += 1;
+    const merged = [...ai.slice(0, head), ...lib, ...ai.slice(head)];
+    const seen = new Set();
+    const out = [];
+    for (const token of merged) {
+        const key = tagKey(token);
+        if (!key || seen.has(key)) continue;
+        seen.add(key);
+        out.push(token);
+    }
+    return out.join(', ');
+}
+
+/** 角色 caption 里的计数 tag 降级：1girl→girl、1boy→boy，多人计数直接删掉。 */
+function convertCountTags(tag) {
+    const out = [];
+    const seen = new Set();
+    for (const token of splitTagList(tag)) {
+        const value = token.trim();
+        const count = /^(\d+)\s*(girl|boy)s?$/i.exec(value);
+        let next = value;
+        if (count) {
+            if (Number(count[1]) !== 1) continue;
+            next = count[2].toLowerCase();
+        } else if (/^(multiple|several|many)\s+(girls?|boys?|people|others|crowd)$/i.test(value)) {
+            continue;
+        }
+        const key = next.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push(next);
+    }
+    return out.join(', ');
+}
+
+/** 角色 caption：最终 tag + 库里的 nl + AI 写的 nl（空段跳过）。 */
+function buildCharacterCaption(tag, ...nls) {
+    const parts = [convertCountTags(tag), ...nls.map(value => String(value ?? '').trim()).filter(Boolean)].filter(Boolean);
+    return parts.join(', ');
+}
+
+function buildMarkerBase(payload) {
+    return [textOf(payload?.tag), textOf(payload?.nl)].filter(Boolean).join(', ');
+}
+
+/**
+ * 组装一条结构化标记：base + 每个角色（可查询库）的最终 caption。
+ * options.lookup(name) → { tags, nl, charRef } | null
+ * options.expand(text) → 展开 $名字$
+ */
+function buildMarkerPlan(payload, { lookup = () => null, expand = value => value } = {}) {
+    const base = expand(buildMarkerBase(payload));
+    const characters = [];
+    const charRefs = [];
+    for (const entry of payload?.characters || []) {
+        const info = lookup(entry.name);
+        let tag = expand(entry.tag || '');
+        const libraryTags = info?.tags ? expand(info.tags) : '';
+        if (libraryTags) tag = injectLibraryTags(tag, libraryTags);
+        const caption = buildCharacterCaption(tag, info?.nl || '', expand(entry.nl || ''));
+        characters.push({ name: entry.name, tag, caption, charRef: info?.charRef || '' });
+        if (info?.charRef) charRefs.push(info.charRef);
+    }
+    const captions = characters.map(item => item.caption).filter(Boolean);
+    return {
+        base,
+        characters,
+        charRefs: [...new Set(charRefs)],
+        size: payload?.size || '',
+        recordPrompt: [base, ...captions].filter(Boolean).join('\n'),
+    };
+}
+
+/** 按 size 决定是否交换宽高；不需要交换时返回 {}。 */
+function swapSizeForOrientation(size, width, height) {
+    const w = Number(width);
+    const h = Number(height);
+    if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) return {};
+    if (size === 'portrait' && w > h) return { width: h, height: w };
+    if (size === 'landscape' && h > w) return { width: h, height: w };
+    return {};
+}
+
+/** v3 不支持分角色：把 caption 直接接回 base。 */
+function appendCaptionsToBase(base, captions) {
+    return [base, ...(Array.isArray(captions) ? captions : [])].filter(Boolean).join(', ');
+}
+
+// 角色外观库：<人物> / <外貌变化> 块 → 按楼重放的角色档案。
+// 纯函数，不碰 DOM、不发请求；构建时由 tools/apply-char-lib.mjs 去掉 export 后内联进 runtime.js。
+// 设计（与 README「角色外观库」一节一致）：
+// - 全局库 = piaoce_data.json 的 characters，AI 只读；本聊天库 = chatMetadata[CHAT_META_KEY]。
+// - 回复里的块不直接写库，而是写成该消息的 ops（msg.extra[CHAR_OPS_KEY]），按楼层重放。
+// - 状态(N) = 本聊天基线 + 第 0..N 楼（含本楼）的 ops；swipe 不匹配的 ops 忽略。
+
+const CHAT_META_KEY = 'zhiku_chat_chars';
+const CHAR_OPS_KEY = 'zhikuCharOps';
+const CHAR_BLOCK_TYPES = ['人物', '外貌变化'];
+
+/** 用于正则里匹配两种块（不含 $ 与反斜杠问题）。 */
+const CHAR_BLOCK_PATTERN_SOURCE = '<(?:人物|外貌变化)>[\\s\\S]*?<\\/(?:人物|外貌变化)>';
+
+/** 全角标点与全角尖括号 → 半角，便于解析。 */
+function normalizeBlockText(text) {
+    return String(text ?? '')
+        .replace(/＜/g, '<')
+        .replace(/＞/g, '>')
+        .replace(/／/g, '/')
+        .replace(/：/g, ':')
+        .replace(/，/g, ',')
+        .replace(/；/g, ';');
+}
+
+function splitAliasList(value) {
+    const raw = Array.isArray(value) ? value : String(value ?? '').split(/[|,，、;；\n]+/);
+    const out = [];
+    for (const item of raw) {
+        const name = String(item ?? '').trim();
+        if (name && !out.includes(name)) out.push(name);
+    }
+    return out;
+}
+
+/** "tag, tag（中文）, tag" → [{en, zh}]；没写中文的 zh 为空。全角逗号/分号也认。 */
+function pairsFromTags(text) {
+    return String(text ?? '')
+        .replace(/，/g, ',')
+        .replace(/；/g, ';')
+        .split(/[,、;]+/)
+        .map(item => item.trim())
+        .filter(Boolean)
+        .map(item => {
+            const match = /^(.+?)[（(]([^（）()]*)[)）]$/.exec(item);
+            return match ? { en: match[1].trim(), zh: match[2].trim() } : { en: item, zh: '' };
+        })
+        .filter(pair => pair.en);
+}
+
+function tagsText(list) {
+    return (Array.isArray(list) ? list : [])
+        .map(item => String(item?.en ?? item ?? '').trim())
+        .filter(Boolean)
+        .join(', ');
+}
+
+function clonePairs(list) {
+    return (Array.isArray(list) ? list : []).map(item => ({ en: String(item?.en ?? '').trim(), zh: String(item?.zh ?? '').trim() })).filter(item => item.en);
+}
+
+function parseBlockFields(body) {
+    const fields = {};
+    for (const rawLine of normalizeBlockText(body).split(/\r?\n/)) {
+        const line = rawLine.trim().replace(/^[-*+]\s*/, '');
+        const cut = line.indexOf(':');
+        if (cut <= 0) continue;
+        const key = line.slice(0, cut).trim();
+        const value = line.slice(cut + 1).trim();
+        if (!key || !value) continue;
+        fields[key] = fields[key] === undefined ? value : `${fields[key]}, ${value}`;
+    }
+    return fields;
+}
+
+/** 从回复里解析出两种块，顺序与出现位置保留。 */
+function parseCharacterBlocks(text) {
+    const source = normalizeBlockText(text);
+    const out = [];
+    const regex = /<(人物|外貌变化)>([\s\S]*?)<\/\1>/g;
+    let match;
+    while ((match = regex.exec(source)) !== null) {
+        out.push({
+            type: match[1] === '人物' ? 'person' : 'change',
+            fields: parseBlockFields(match[2]),
+            raw: match[0],
+            index: match.index,
+        });
+    }
+    return out;
+}
+
+function nowOf(value) {
+    return Number.isFinite(value) ? value : Date.now();
+}
+
+/**
+ * 把回复文本转成 ops。
+ * options.locked  只在全局库里的名字（AI 只读）
+ * options.known   已经建过档的本聊天角色名（第 0..N-1 楼的状态）
+ * options.at      时间戳（测试可固定）
+ * 返回 { ops, logs }：logs 是需要写调试日志的忽略原因。
+ */
+function buildCharOps(text, { locked = new Set(), known = new Set(), at = Date.now() } = {}) {
+    const ops = [];
+    const logs = [];
+    const createdHere = new Set();
+    const stamp = nowOf(at);
+    for (const block of parseCharacterBlocks(text)) {
+        const f = block.fields;
+        const name = String(f['名字'] ?? '').trim();
+        if (!name) {
+            logs.push('有块没写「名字」，忽略');
+            continue;
+        }
+        if (locked.has(name)) {
+            logs.push(`${name} 在全局库里（固定），忽略 <${block.type === 'person' ? '人物' : '外貌变化'}>`);
+            continue;
+        }
+        if (block.type === 'person') {
+            if (known.has(name) || createdHere.has(name)) {
+                logs.push(`${name} 已建档，忽略 <人物>`);
+                continue;
+            }
+            createdHere.add(name);
+            const outfit = pairsFromTags(f['衣服']);
+            ops.push({
+                kind: 'new',
+                name,
+                aliases: splitAliasList(f['别名']),
+                appearance: pairsFromTags(f['外貌']),
+                nl: String(f['描述'] ?? '').trim(),
+                outfitMode: outfit.length ? 'fixed' : 'story',
+                outfit,
+                reason: String(f['原因'] ?? '').trim() || '首次出场',
+                pos: block.index,
+                at: stamp,
+            });
+            continue;
+        }
+        if (!known.has(name) && !createdHere.has(name)) {
+            logs.push(`${name} 没有档案，忽略 <外貌变化>`);
+            continue;
+        }
+        const add = pairsFromTags(f['加']);
+        const remove = pairsFromTags(f['去']);
+        const full = pairsFromTags(f['外貌']);
+        const nl = f['描述'] === undefined ? undefined : String(f['描述']).trim();
+        let outfit;
+        if (f['衣服'] !== undefined) {
+            outfit = /^(跟剧情|剧情|story)$/i.test(String(f['衣服']).trim()) ? 'story' : pairsFromTags(f['衣服']);
+        }
+        if (!add.length && !remove.length && !full.length && outfit === undefined && nl === undefined) {
+            logs.push(`${name} 的变化块没有内容，忽略`);
+            continue;
+        }
+        ops.push({
+            kind: 'set',
+            name,
+            add,
+            remove,
+            appearance: full.length ? full : undefined,
+            nl,
+            outfit,
+            reason: String(f['原因'] ?? '').trim(),
+            pos: block.index,
+            at: stamp,
+        });
+    }
+    return { ops, logs };
+}
+
+/** 设置开关关掉时，不解析也不写 ops。 */
+function buildCharOpsIfEnabled(text, options = {}) {
+    if (options.enabled === false) return { ops: [], logs: [] };
+    return buildCharOps(text, options);
+}
+
+function outfitIdFor(floor, name) {
+    return `o_${floor}_${String(name).replace(/[^\w\u4e00-\u9fa5]+/g, '_')}`;
+}
+
+const HISTORY_CAP = 50;
+
+function entrySnapshot(entry) {
+    const outfit = (entry.outfits || []).find(o => o.id === entry.outfitId) || (entry.outfits || [])[0] || null;
+    return {
+        appearance: tagsText(entry.appearance),
+        outfitMode: entry.outfitMode === 'fixed' ? 'fixed' : 'story',
+        outfit: tagsText(outfit?.tags),
+        nl: String(entry.nl ?? '').trim(),
+    };
+}
+
+function outfitText(snapshot) {
+    return snapshot.outfitMode === 'fixed' ? `固定：${snapshot.outfit || ''}` : '跟剧情';
+}
+
+function pushHistory(entry, record) {
+    entry.history.push(record);
+    if (entry.history.length > HISTORY_CAP) entry.history.splice(0, entry.history.length - HISTORY_CAP);
+}
+
+/** 一条 op 引起的字段级历史（new / appearance / outfit / nl）。 */
+function historyRecordsForOp(floor, op, before, after) {
+    const at = nowOf(op.at);
+    const reason = String(op.reason || '');
+    if (!before) return [{ field: 'new', from: '', to: after.appearance || '', reason, floor, at }];
+    const out = [];
+    if (before.appearance !== after.appearance) out.push({ field: 'appearance', from: before.appearance, to: after.appearance, reason, floor, at });
+    if (before.outfit !== after.outfit || before.outfitMode !== after.outfitMode) out.push({ field: 'outfit', from: outfitText(before), to: outfitText(after), reason, floor, at });
+    if (before.nl !== after.nl) out.push({ field: 'nl', from: before.nl, to: after.nl, reason, floor, at });
+    return out;
+}
+
+function cloneEntry(entry) {
+    return {
+        ...entry,
+        aliases: Array.isArray(entry.aliases) ? [...entry.aliases] : [],
+        nl: String(entry.nl ?? ''),
+        appearance: clonePairs(entry.appearance),
+        outfits: (Array.isArray(entry.outfits) ? entry.outfits : []).map(o => ({ id: o.id, name: o.name || '', tags: clonePairs(o.tags) })),
+        history: Array.isArray(entry.history) ? entry.history.slice(-HISTORY_CAP).map(h => ({ ...h })) : [],
+    };
+}
+
+/** 把 ops 应用到一份档案数组，返回新数组（不修改入参）。pos 给定时，只应用位置在它之前的 <外貌变化>。 */
+function applyCharOps(entries, ops, floor, { locked, pos } = {}) {
+    let out = (Array.isArray(entries) ? entries : []).map(cloneEntry);
+    for (const op of Array.isArray(ops) ? ops : []) {
+        if (!op || !op.name) continue;
+        if (locked && locked.has(op.name)) continue;
+        if (op.kind === 'set' && Number.isFinite(op.pos) && pos !== undefined && pos !== null && !(pos > op.pos)) continue;
+        if (op.kind === 'new') {
+            if (out.some(entry => entry.name === op.name)) continue;
+            const outfitTags = clonePairs(op.outfit);
+            const id = outfitIdFor(floor, op.name);
+            const entry = {
+                name: op.name,
+                aliases: splitAliasList(op.aliases),
+                appearance: clonePairs(op.appearance),
+                nl: String(op.nl ?? '').trim(),
+                outfitMode: op.outfitMode === 'fixed' && outfitTags.length ? 'fixed' : 'story',
+                outfitModeExplicit: op.outfitMode === 'fixed' && !!outfitTags.length,
+                outfits: outfitTags.length ? [{ id, name: '固定着装', tags: outfitTags }] : [],
+                outfitId: outfitTags.length ? id : '',
+                source: 'ai',
+                history: [],
+            };
+            for (const record of historyRecordsForOp(floor, op, null, entrySnapshot(entry))) pushHistory(entry, record);
+            out.push(entry);
+            continue;
+        }
+        const entry = out.find(item => item.name === op.name);
+        if (!entry) continue;
+        const before = entrySnapshot(entry);
+        if (Array.isArray(op.appearance) && op.appearance.length) entry.appearance = clonePairs(op.appearance);
+        if (Array.isArray(op.remove) && op.remove.length) {
+            const drop = new Set(op.remove.map(tag => String(tag.en || '').trim().toLowerCase()).filter(Boolean));
+            entry.appearance = entry.appearance.filter(tag => !drop.has(tag.en.toLowerCase()));
+        }
+        if (Array.isArray(op.add) && op.add.length) {
+            for (const tag of op.add) {
+                const key = String(tag.en || '').trim().toLowerCase();
+                if (key && !entry.appearance.some(item => item.en.toLowerCase() === key)) entry.appearance.push({ ...tag });
+            }
+        }
+        if (op.nl !== undefined) entry.nl = String(op.nl).trim();
+        if (op.outfit !== undefined) {
+            if (op.outfit === 'story') {
+                entry.outfitMode = 'story';
+            } else {
+                const id = outfitIdFor(floor, entry.name);
+                entry.outfits = [{ id, name: '固定着装', tags: clonePairs(op.outfit) }];
+                entry.outfitId = id;
+                entry.outfitMode = 'fixed';
+            }
+            entry.outfitModeExplicit = true;
+        }
+        entry.source = 'ai';
+        for (const record of historyRecordsForOp(floor, op, before, entrySnapshot(entry))) pushHistory(entry, record);
+    }
+    return out;
+}
+
+function messageOps(message) {
+    const raw = message?.extra?.[CHAR_OPS_KEY];
+    if (!raw || raw.v !== 1 || !Array.isArray(raw.ops)) return null;
+    return { v: 1, swipe: Number.isInteger(raw.swipe) ? raw.swipe : 0, ops: raw.ops };
+}
+
+function messageOpsPayload(ops, swipe) {
+    const list = Array.isArray(ops) ? ops : [];
+    return list.length ? { v: 1, swipe: Number.isInteger(swipe) ? swipe : 0, ops: list } : undefined;
+}
+
+/** 忽略 at 的比较，避免每次渲染都重写消息。 */
+function sameCharOps(a, b) {
+    const strip = list => JSON.stringify((Array.isArray(list) ? list : []).map(op => {
+        const { at, ...rest } = op || {};
+        return rest;
+    }));
+    return strip(a) === strip(b);
+}
+
+function activeSwipe(message) {
+    return Number.isInteger(message?.swipe_id) ? message.swipe_id : 0;
+}
+
+/**
+ * 按楼层重放：stateAt(floor) = 基线 + 第 0..floor 楼（含）里 swipe 匹配的 ops。
+ * 返回的对象里 stateAt 返回的是内部数组，调用方只读，不要原地改。
+ */
+function deriveTimeline(baseEntries, chat, { locked } = {}) {
+    const base = (Array.isArray(baseEntries) ? baseEntries : []).map(cloneEntry);
+    const states = [];
+    const partial = new Map();
+    let current = base;
+    for (let floor = 0; floor < (Array.isArray(chat) ? chat.length : 0); floor += 1) {
+        const message = chat[floor];
+        const delta = messageOps(message);
+        if (!delta || delta.swipe !== activeSwipe(message)) {
+            states.push(current);
+            continue;
+        }
+        current = applyCharOps(current, delta.ops, floor, { locked });
+        states.push(current);
+    }
+    return {
+        base: base.map(cloneEntry),
+        /** pos 给定时 = 该楼里「开始位置在 pos 之前」的状态（只应用 pos 之前的 <外貌变化>）。 */
+        stateAt(floor, pos) {
+            const n = Number(floor);
+            if (!Number.isFinite(n) || n < 0) return base.map(cloneEntry);
+            const previous = n === 0 ? base : (states[n - 1] || base);
+            const delta = chat[n] ? messageOps(chat[n]) : null;
+            const whole = states[n] || (states.length ? states[states.length - 1] : base);
+            if (!delta || delta.swipe !== activeSwipe(chat[n]) || pos === undefined || pos === null) return whole;
+            const key = `${n}:${pos}`;
+            if (partial.has(key)) return partial.get(key);
+            const filtered = delta.ops.filter(op => op.kind === 'new' || !Number.isFinite(op.pos) || pos > op.pos);
+            const out = applyCharOps(previous, filtered, n, { locked });
+            partial.set(key, out);
+            return out;
+        },
+        latest() {
+            return states.length ? states[states.length - 1] : base.map(cloneEntry);
+        },
+    };
+}
+
+/** 把某名字在历史楼层里的 ops 清掉（手动改档后不让重放覆盖）。返回改动处数。 */
+function stripOpsForName(chat, name) {
+    const target = String(name ?? '').trim();
+    if (!target) return 0;
+    let changed = 0;
+    for (const message of Array.isArray(chat) ? chat : []) {
+        const holders = [message, ...(Array.isArray(message?.swipe_info) ? message.swipe_info : [])];
+        for (const holder of holders) {
+            const raw = holder?.extra?.[CHAR_OPS_KEY];
+            if (!raw || !Array.isArray(raw.ops)) continue;
+            const next = raw.ops.filter(op => op?.name !== target);
+            if (next.length === raw.ops.length) continue;
+            if (next.length) holder.extra[CHAR_OPS_KEY] = { v: 1, swipe: Number.isInteger(raw.swipe) ? raw.swipe : 0, ops: next };
+            else delete holder.extra[CHAR_OPS_KEY];
+            changed += 1;
+        }
+    }
+    return changed;
+}
+
+/** 全局库里、且本聊天基线没有同名的角色 = 锁定（AI 只读）。 */
+function lockedCharNames(characters, baseEntries) {
+    const base = new Set((Array.isArray(baseEntries) ? baseEntries : []).map(entry => entry.name));
+    const locked = new Set();
+    for (const character of Object.values(characters || {})) {
+        const name = String(character?.name ?? '').trim();
+        if (name && !base.has(name)) locked.add(name);
+    }
+    return locked;
+}
+
+function normalizeOutfits(list) {
+    return (Array.isArray(list) ? list : []).map(outfit => ({
+        id: String(outfit?.id ?? ''),
+        name: String(outfit?.name ?? ''),
+        tags: clonePairs(outfit?.tags),
+    })).filter(outfit => outfit.id);
+}
+
+function normalizeHistory(raw) {
+    if (!Array.isArray(raw)) return [];
+    const out = [];
+    for (const item of raw.slice(-HISTORY_CAP)) {
+        if (!item || typeof item !== 'object') continue;
+        if (item.before || item.after) {
+            // 旧格式：{ floor, reason, at, before:{appearance,outfit,...}, after:{...} }
+            const before = item.before?.appearance || '';
+            const after = item.after?.appearance || '';
+            out.push({ field: item.before ? 'appearance' : 'new', from: before, to: after, reason: String(item.reason || ''), floor: Number.isInteger(item.floor) ? item.floor : -1, at: Number.isFinite(item.at) ? item.at : 0 });
+            continue;
+        }
+        out.push({
+            field: String(item.field || 'appearance'),
+            from: String(item.from ?? ''),
+            to: String(item.to ?? ''),
+            reason: String(item.reason || ''),
+            floor: Number.isInteger(item.floor) ? item.floor : -1,
+            at: Number.isFinite(item.at) ? item.at : 0,
+        });
+    }
+    return out.slice(-HISTORY_CAP);
+}
+
+function normalizeChatEntry(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    const name = String(raw.name ?? '').trim();
+    if (!name) return null;
+    const outfits = normalizeOutfits(raw.outfits);
+    const outfitId = outfits.some(o => o.id === raw.outfitId) ? raw.outfitId : (outfits[0]?.id || '');
+    const outfitMode = raw.outfitMode === 'fixed' && outfits.length ? 'fixed' : 'story';
+    return {
+        name,
+        aliases: splitAliasList(raw.aliases).filter(alias => alias !== name),
+        appearance: clonePairs(raw.appearance),
+        nl: typeof raw.nl === 'string' ? raw.nl.trim() : '',
+        outfitMode,
+        outfitModeExplicit: raw.outfitModeExplicit === true || outfitMode === 'fixed',
+        outfits,
+        outfitId,
+        source: raw.source === 'ai' ? 'ai' : 'manual',
+        history: normalizeHistory(raw.history),
+    };
+}
+
+function normalizeChatStore(raw) {
+    const entries = Array.isArray(raw?.entries) ? raw.entries : [];
+    const out = [];
+    for (const item of entries) {
+        const entry = normalizeChatEntry(item);
+        if (entry && !out.some(e => e.name === entry.name)) out.push(entry);
+    }
+    return out;
+}
+
+function chatStorePayload(entries) {
+    return { v: 1, entries: (Array.isArray(entries) ? entries : []).map(cloneEntry) };
+}
+
+/** 从全局角色复制一份聊天库条目（「复制到本聊天」）。 */
+function entryFromGlobal(character) {
+    return normalizeChatEntry({
+        name: character?.name,
+        aliases: character?.aliases,
+        appearance: character?.appearance,
+        nl: character?.nl,
+        outfitMode: character?.outfitMode,
+        outfits: character?.outfits,
+        outfitId: character?.outfitId,
+        source: 'manual',
+        history: [],
+    });
+}
+
+/** 聊天库条目 → 全局角色（「提升为全局」）。 */
+function globalFromChatEntry(entry) {
+    const normalized = normalizeChatEntry(entry);
+    if (!normalized) return null;
+    return {
+        name: normalized.name,
+        aliases: normalized.aliases,
+        appearance: normalized.appearance,
+        nl: normalized.nl,
+        outfitMode: normalized.outfitMode,
+        outfits: normalized.outfits,
+        outfitId: normalized.outfitId,
+        negative: '',
+        charRef: '',
+    };
+}
+
+/**
+ * 本聊天条目 + 同名全局角色 → 字段级合并结果。
+ * appearance / nl 空时用全局；outfit 在「没有衣服且没有显式 outfitMode」时用全局；
+ * aliases 取并集；charRef 用本聊天的，没有再用全局的。
+ * 返回 { entry, sources }：sources 标出每个字段来自 'chat' 还是 'global'。
+ */
+function mergeCharacterLayers(chatEntry, globalChar) {
+    const chat = normalizeChatEntry(chatEntry);
+    if (!chat) return null;
+    if (!globalChar) return { entry: chat, sources: { appearance: 'chat', nl: chat.nl ? 'chat' : 'chat', outfit: 'chat', aliases: 'chat' } };
+    const globalName = String(globalChar.name ?? '').trim();
+    const global = {
+        name: globalName,
+        aliases: splitAliasList(globalChar.aliases).filter(alias => alias && alias !== globalName),
+        appearance: clonePairs(globalChar.appearance),
+        nl: typeof globalChar.nl === 'string' ? globalChar.nl.trim() : '',
+        outfitMode: globalChar.outfitMode === 'fixed' ? 'fixed' : 'story',
+        outfits: normalizeOutfits(globalChar.outfits),
+        outfitId: String(globalChar.outfitId ?? ''),
+        charRef: String(globalChar.charRef ?? ''),
+    };
+    const useChatAppearance = chat.appearance.length > 0;
+    const useChatNl = !!chat.nl;
+    const useChatOutfit = chat.outfitModeExplicit === true || chat.outfits.length > 0 || chat.outfitMode === 'fixed';
+    const aliases = [];
+    for (const alias of [...chat.aliases, ...global.aliases]) if (!aliases.includes(alias)) aliases.push(alias);
+    const entry = {
+        ...chat,
+        aliases,
+        appearance: useChatAppearance ? chat.appearance : global.appearance,
+        nl: useChatNl ? chat.nl : global.nl,
+        outfitMode: useChatOutfit ? chat.outfitMode : global.outfitMode,
+        outfits: useChatOutfit ? chat.outfits : global.outfits,
+        outfitId: useChatOutfit ? chat.outfitId : (global.outfitId || global.outfits[0]?.id || ''),
+        charRef: chat.charRef || global.charRef,
+    };
+    return {
+        entry,
+        sources: {
+            appearance: useChatAppearance ? 'chat' : 'global',
+            nl: useChatNl ? 'chat' : 'global',
+            outfit: useChatOutfit ? 'chat' : 'global',
+            aliases: 'union',
+        },
+    };
+}
+
+/**
+ * 把一组本聊天条目逐个与「同名」全局角色做字段级合并，给 $名字$ 展开和 JSON 标记用：
+ * 本聊天条目外貌/描述/服装为空时回落到全局，别名取并集。没有同名全局角色的条目原样保留。
+ */
+function mergeChatEntriesWithGlobals(chatEntries, globals) {
+    const byName = new Map();
+    for (const character of Array.isArray(globals) ? globals : []) {
+        const name = String(character?.name ?? '').trim();
+        if (name && !byName.has(name)) byName.set(name, character);
+    }
+    return (Array.isArray(chatEntries) ? chatEntries : []).map(entry => {
+        const merged = mergeCharacterLayers(entry, byName.get(String(entry?.name ?? '').trim()));
+        return merged ? merged.entry : entry;
+    });
+}
+
+/** 历史记录追加并封顶（各 50 条，最旧的丢掉）。 */
+function capHistory(records) {
+    return (Array.isArray(records) ? records : []).slice(-HISTORY_CAP);
+}
+
+/** 把某名字在各楼层的 ops 收成字段级历史记录（不修改消息）。 */
+function historyFromOps(timeline, name, chat) {
+    const target = String(name ?? '').trim();
+    if (!target || !timeline) return [];
+    const floors = new Map();
+    (Array.isArray(chat) ? chat : []).forEach((message, floor) => {
+        const delta = messageOps(message);
+        if (!delta || delta.swipe !== activeSwipe(message)) return;
+        const ops = delta.ops.filter(op => op?.name === target);
+        if (ops.length) floors.set(floor, ops);
+    });
+    const records = [];
+    let running = null;
+    for (const floor of [...floors.keys()].sort((a, b) => a - b)) {
+        for (const op of floors.get(floor)) {
+            const before = running ? entrySnapshot(running) : null;
+            const next = applyCharOps(running ? [running] : [], [op], floor)[0] || null;
+            if (!next) continue;
+            records.push(...historyRecordsForOp(floor, op, before, entrySnapshot(next)));
+            running = next;
+        }
+    }
+    return capHistory(records);
+}
+
+/** 手动编辑/回滚/删除写进基础档案的历史记录。 */
+function manualHistoryRecord(entry, reason = '手动', at = Date.now()) {
+    return {
+        field: 'manual',
+        from: '',
+        to: tagsText(entry?.appearance),
+        reason,
+        floor: -1,
+        at: Number.isFinite(at) ? at : Date.now(),
+    };
+}
+
+/** 缓存键：聊天长度 + 基线 + 每楼 ops，编辑/滑动/删楼/改基线都会变。 */
+function charCacheKey(chat, baseEntries) {
+    const parts = ['v1'];
+    for (const entry of Array.isArray(baseEntries) ? baseEntries : []) {
+        parts.push(`b|${entry.name}|${tagsText(entry.appearance)}|${entry.nl || ''}|${entry.outfitMode}|${entry.outfitModeExplicit ? 1 : 0}|${entry.outfitId}|${(entry.aliases || []).join('|')}`);
+    }
+    const list = Array.isArray(chat) ? chat : [];
+    for (let i = 0; i < list.length; i += 1) {
+        const delta = messageOps(list[i]);
+        if (delta) parts.push(`o|${i}|${delta.swipe}|${JSON.stringify(delta.ops)}`);
+    }
+    return parts.join(';');
+}
+
+/**
+ * 世界书宏内容：本聊天角色 + 出场角色（全局），按名字去重。
+ * 本聊天条目与同名全局角色做字段级合并（别名并集、固定服装取合并结果），
+ * 只给名字/别名与后缀标记（固定服装 / 全局锁定），不写「写 $名字$」——用法由世界书解释。
+ */
+function chatMacroText(chatEntries, cast, { locked, globals } = {}) {
+    const globalByName = new Map();
+    for (const character of Array.isArray(globals) ? globals : []) {
+        const name = String(character?.name ?? '').trim();
+        if (name && !globalByName.has(name)) globalByName.set(name, character);
+    }
+    const rows = [];
+    const seen = new Set();
+    const push = (name, aliases, fixedOutfit, lockedRow) => {
+        const clean = String(name ?? '').trim();
+        if (!clean || seen.has(clean)) return;
+        seen.add(clean);
+        const extra = (aliases || []).filter(alias => alias && alias !== clean);
+        rows.push(`- ${clean}${extra.length ? `（别名：${extra.join('、')}）` : ''}${fixedOutfit ? '[固定服装]' : ''}${lockedRow ? '[固定，不可改]' : ''}`);
+    };
+    for (const entry of Array.isArray(chatEntries) ? chatEntries : []) {
+        const merged = mergeCharacterLayers(entry, globalByName.get(entry.name));
+        const value = merged?.entry || entry;
+        push(value.name, value.aliases, value.outfitMode === 'fixed', false);
+    }
+    for (const item of Array.isArray(cast) ? cast : []) {
+        if (!item || !item.on || !item.char) continue;
+        push(item.char.name, item.char.aliases, item.char.outfitMode === 'fixed', locked ? locked.has(item.char.name) : false);
+    }
+    return rows.join('\n');
+}
+
+// 世界书宏 {{zhiku_characters}} 的注册与注销。
+// 宿主用 SillyTavern.getContext() 暴露的 registerMacro / unregisterMacro（1.14 的扩展接口）；
+// 老版本或没有这个接口时只写一条 warn，不影响其它功能。
+// 构建时由 tools/apply-char-lib.mjs 去掉 export 后内联进 runtime.js。
+
+const CHAR_MACRO_NAME = 'zhiku_characters';
+
+/**
+ * 注册宏；返回 { supported, uninstall }。
+ * text 是一个函数，每次展开宏时现算（角色开关、聊天切换都能立刻反映）。
+ */
+function installCharMacro(ctx, { text, log = () => {} } = {}) {
+    const api = ctx || {};
+    const read = typeof text === 'function' ? text : () => '';
+    let active = true;
+    const handler = () => (active ? String(read() ?? '') : '');
+    const register = api.registerMacro;
+    if (typeof register !== 'function') {
+        log('[智库] 宿主没有 registerMacro，{{zhiku_characters}} 宏不可用');
+        return { supported: false, uninstall() { active = false; } };
+    }
+    // 不同版本的 registerMacro 签名不一样：先试 (name, handler)，再试 (name, description, handler)。
+    const attempts = register.length >= 3
+        ? [[CHAR_MACRO_NAME, '智库：本聊天出场角色的 $名字$ 清单', handler], [CHAR_MACRO_NAME, handler]]
+        : [[CHAR_MACRO_NAME, handler], [CHAR_MACRO_NAME, '', handler]];
+    let registered = false;
+    for (const args of attempts) {
+        try {
+            register.apply(api, args);
+            registered = true;
+            break;
+        } catch (error) {
+            // 换一种签名再试；都不行会在下面报 warn。
+        }
+    }
+    if (!registered) {
+        log('[智库] 注册 {{zhiku_characters}} 宏失败');
+        return { supported: false, uninstall() { active = false; } };
+    }
+    return {
+        supported: true,
+        uninstall() {
+            active = false;
+            const unregister = api.unregisterMacro;
+            if (typeof unregister === 'function') {
+                try {
+                    unregister.call(api, CHAR_MACRO_NAME);
+                } catch (error) {
+                    log('[智库] 注销 {{zhiku_characters}} 宏失败');
+                }
+            }
+        },
+    };
+}
+
 // ───── chars.js ─────
 const __mod_chars = (() => {
 /**
@@ -1892,13 +2912,13 @@ function currentPersonaKey() {
 
 const blank = src => ({
     key: src.key, kind: src.kind, name: src.name, avatar: src.avatar || '', card: src.card || '',
-    appearance: [], outfitMode: 'story', outfits: [], outfitId: '', negative: '', charRef: '',
+    appearance: [], aliases: [], nl: '', outfitMode: 'story', outfits: [], outfitId: '', negative: '', charRef: '',
 });
 
 /** 取一个角色（还没写过外貌的也给一份空的，存档时才写进数据） */
 function getChar(key) {
     const d = getData();
-    if (d.characters[key]) return d.characters[key];
+    if (d.characters[key]) return ensureAliases(d.characters[key]);
     const src = [...stCards(), ...stPersonas()].find(x => x.key === key);
     return src ? blank(src) : null;
 }
@@ -2110,6 +3130,7 @@ function uniqueName(name) {
 function fromZhihuijiChar(ch, outfits = {}) {
     return {
         name: ch.nameCN || ch.nameEN || '角色',
+        aliases: splitAliases(ch.nameEN),
         appearance: parsePairs([ch.facialFeatures, ch.characterTraits && !T.hasChinese(String(ch.characterTraits).replace(/（[^（）]*）/g, '')) ? ch.characterTraits : ''].filter(Boolean).join(', ')),
         outfitMode: Object.keys(outfits).length ? 'fixed' : 'story',
         outfits: Object.entries(outfits).map(([n, o]) => fromZhihuijiOutfit(n, o)),
@@ -2124,7 +3145,7 @@ function fromZhihuijiOutfit(name, o) {
 function saveCharacterPost(payload, fallbackName) {
     const src = payload.character || {};
     const ours = Array.isArray(src.appearance)
-        ? { name: src.name, appearance: src.appearance, outfitMode: src.outfitMode || 'story', outfits: (src.outfits || []).map(o => ({ ...o, id: M.uid('o_') })), negative: src.negative || '' }
+        ? { name: src.name, aliases: splitAliases(src.aliases), nl: String(src.nl || '').trim(), appearance: src.appearance, outfitMode: src.outfitMode || 'story', outfits: (src.outfits || []).map(o => ({ ...o, id: M.uid('o_') })), negative: src.negative || '' }
         : fromZhihuijiChar(src, payload.outfits || {});
     const c = blank({ key: 'free:' + M.uid(''), kind: 'free', name: uniqueName(ours.name || fallbackName) });
     Object.assign(c, ours, { name: c.name });
@@ -2141,7 +3162,7 @@ function outfitFromPost(payload, fallbackName) {
 
 /** 分享用的内容 */
 function characterPayload(c) {
-    return { character: { name: c.name, appearance: c.appearance, outfitMode: c.outfitMode, outfits: c.outfits.map(({ name, tags }) => ({ name, tags })), negative: c.negative } };
+    return { character: { name: c.name, aliases: splitAliases(c.aliases), nl: String(c.nl || '').trim(), appearance: c.appearance, outfitMode: c.outfitMode, outfits: c.outfits.map(({ name, tags }) => ({ name, tags })), negative: c.negative } };
 }
 
 /** 智绘姬里存的角色全搬过来，返回搬了几个 */
@@ -2174,6 +3195,7 @@ function copyLook(fromKey, toKey) {
     b.outfits = a.outfits.map(o => ({ ...structuredClone(o), id: M.uid('o_') }));
     b.outfitId = b.outfits[0]?.id || '';
     b.negative = a.negative;
+    b.nl = String(a.nl || '');
     saveChar(b);
 }
 
@@ -2219,7 +3241,245 @@ function deleteOutfit(ownerKey, id) {
     commit();
 }
 
-return { avatarUrl, stCards, stPersonas, currentPersonaKey, getChar, saveChar, descOf, sideKicks, addSideKick, deleteChar, chatId, currentCast, removeFromCast, setCastOn, tagText, currentOutfit, fixedTags, canSplit, buildChatPrompt, previewCast, generateForMessage, insertImage, parsePairs, freeChars, saveCharacterPost, outfitFromPost, characterPayload, importZhihuijiCharacters, copyLook, wardrobe, findOutfit, giveOutfit, deleteOutfit };
+function allChars() {
+    return Object.values(getData().characters).map(ensureAliases);
+}
+
+function chatMeta() {
+    const c = ctx();
+    if (!c) return null;
+    if (!c.chatMetadata) { try { c.chatMetadata = {}; } catch (error) { return null; } }
+    return c.chatMetadata || null;
+}
+function saveChatMeta() {
+    const c = ctx();
+    try { c?.saveMetadata?.(); } catch (error) { /* 宿主不支持就算了 */ }
+    try { c?.saveMetadataDebounced?.(); } catch (error) { /* 同上 */ }
+}
+function chatBaseEntries() {
+    return normalizeChatStore(chatMeta()?.[CHAT_META_KEY]);
+}
+function writeChatBase(entries) {
+    const meta = chatMeta();
+    if (!meta) return false;
+    meta[CHAT_META_KEY] = chatStorePayload(entries);
+    saveChatMeta();
+    invalidateCharState();
+    return true;
+}
+let charStateCache = null;
+function chatTimeline() {
+    const chat = ctx()?.chat || [];
+    const base = chatBaseEntries();
+    const locked = lockedCharNames(getData().characters || {}, base);
+    const key = charCacheKey(chat, base) + '|L:' + [...locked].sort().join(',');
+    if (charStateCache && charStateCache.key === key) return charStateCache.timeline;
+    const timeline = deriveTimeline(base, chat, { locked });
+    charStateCache = { key, timeline };
+    return timeline;
+}
+function invalidateCharState() { charStateCache = null; }
+function chatStateAt(floor, pos) { return chatTimeline().stateAt(floor, pos); }
+function chatLatest() { return chatTimeline().latest(); }
+function chatLockedNames() {
+    return lockedCharNames(getData().characters || {}, chatBaseEntries());
+}
+
+/** 本聊天条目 + 同名全局角色做字段级合并，给 UI 与宏用。 */
+function mergedChatEntries() {
+    const globals = allChars();
+    const byName = new Map(globals.map(character => [String(character.name || '').trim(), character]));
+    return chatLatest().map(entry => {
+        const merged = mergeCharacterLayers(entry, byName.get(entry.name));
+        return { entry: merged?.entry || entry, sources: merged?.sources || {}, base: entry };
+    });
+}
+
+/** 回复里的 <人物> / <外貌变化> → 本楼 ops（按楼层重放，不写基线）。 */
+function applyCharacterBlocks(id) {
+    if (getData().options.charAutoBlocks === false) return 0;
+    const c = ctx();
+    const msg = c?.chat?.[Number(id)];
+    if (!msg || msg.is_system) return 0;
+    const floor = Number(id);
+    const base = chatBaseEntries();
+    const locked = lockedCharNames(getData().characters || {}, base);
+    const prior = chatTimeline().stateAt(floor - 1);
+    const known = new Set(prior.map(entry => entry.name));
+    const built = buildCharOpsIfEnabled(String(msg.mes || ''), { enabled: getData().options.charAutoBlocks !== false, locked, known });
+    if (built.logs.length) console.info('[智库] 角色块：' + built.logs.join('；'));
+    const swipe = Number.isInteger(msg.swipe_id) ? msg.swipe_id : 0;
+    const existing = msg.extra?.[CHAR_OPS_KEY];
+    if (existing && Number(existing.swipe) === swipe && sameCharOps(existing.ops, built.ops)) return built.ops.length;
+    const payload = messageOpsPayload(built.ops, swipe);
+    msg.extra ||= {};
+    if (payload) msg.extra[CHAR_OPS_KEY] = payload;
+    else delete msg.extra[CHAR_OPS_KEY];
+    try { void c.saveChat?.(); } catch (error) { console.warn('[智库] 保存角色块失败', error); }
+    invalidateCharState();
+    if (built.ops.length && getData().options.charBlockToast !== false) {
+        const text = built.ops.map(op => op.kind === 'new' ? `新建角色 ${op.name}` : `${op.name} 外貌变化`).join(' / ');
+        toastr.info('智库：' + text, '角色档案', { timeOut: 3000 });
+    }
+    return built.ops.length;
+}
+
+function stripOpsEverywhere(name) {
+    const c = ctx();
+    const removed = stripOpsForName(c?.chat || [], name);
+    if (removed) { try { void c?.saveChat?.(); } catch (error) { /* ignore */ } invalidateCharState(); }
+    return removed;
+}
+function saveChatEntry(entry, oldName, { reason = '手动' } = {}) {
+    const name = String(entry?.name || '').trim();
+    if (!name) return false;
+    const old = String(oldName || name);
+    const base = chatBaseEntries();
+    const previous = base.find(item => item.name === old) || null;
+    // 先把这个名字在各楼层的 ops 收成字段级历史，再清掉 ops；这样手动值不会被重放覆盖，历史也还在。
+    const absorbed = historyFromOps(chatTimeline(), old, ctx()?.chat || []);
+    const next = normalizeChatEntry({ ...entry, name, source: 'manual' });
+    if (!next) return false;
+    next.history = capHistory([...(previous?.history || []), ...absorbed, manualHistoryRecord(next, reason)]);
+    const index = base.findIndex(item => item.name === old);
+    const dup = base.findIndex(item => item.name === name);
+    if (index >= 0) base[index] = next;
+    else if (dup >= 0) base[dup] = next;
+    else base.push(next);
+    writeChatBase(base);
+    stripOpsEverywhere(old);
+    if (old !== name) stripOpsEverywhere(name);
+    return true;
+}
+function deleteChatEntry(name) {
+    const clean = String(name || '').trim();
+    if (!clean) return false;
+    const base = chatBaseEntries();
+    const entry = base.find(item => item.name === clean);
+    if (entry) {
+        const absorbed = historyFromOps(chatTimeline(), clean, ctx()?.chat || []);
+        entry.history = capHistory([...(entry.history || []), ...absorbed, manualHistoryRecord(entry, '手动删除')]);
+    }
+    writeChatBase(base.filter(item => item.name !== clean));
+    stripOpsEverywhere(clean);
+    return true;
+}
+function chatEntryRollback(name, index) {
+    const entry = chatLatest().find(item => item.name === name) || chatBaseEntries().find(item => item.name === name);
+    const record = entry?.history?.[Number(index)];
+    if (!record) return false;
+    if (record.field === 'new') return deleteChatEntry(entry.name);
+    const patch = {
+        name: entry.name,
+        aliases: entry.aliases,
+        appearance: entry.appearance,
+        nl: entry.nl,
+        outfitMode: entry.outfitMode,
+        outfitModeExplicit: entry.outfitModeExplicit,
+        outfits: entry.outfits,
+        outfitId: entry.outfitId,
+    };
+    if (record.field === 'appearance' || record.field === 'manual') patch.appearance = pairsFromTags(record.from);
+    else if (record.field === 'nl') patch.nl = record.from;
+    else if (record.field === 'outfit') {
+        if (record.from === '跟剧情') {
+            patch.outfitMode = 'story';
+            patch.outfitModeExplicit = true;
+        } else {
+            const id = 'o_rollback';
+            patch.outfits = [{ id, name: '固定着装', tags: pairsFromTags(String(record.from || '').replace(/^固定：/, '')) }];
+            patch.outfitId = id;
+            patch.outfitMode = 'fixed';
+            patch.outfitModeExplicit = true;
+        }
+    }
+    return saveChatEntry(patch, entry.name, { reason: '手动回滚' });
+}
+function promoteChatEntry(name) {
+    const entry = chatLatest().find(item => item.name === name);
+    if (!entry) return false;
+    const global = globalFromChatEntry(entry);
+    if (!global) return false;
+    const d = getData();
+    d.characters ||= {};
+    const key = 'free:' + M.uid('');
+    d.characters[key] = { ...global, key, kind: 'free', name: uniqueName(global.name) };
+    commit();
+    deleteChatEntry(entry.name);
+    return true;
+}
+function copyGlobalToChat(key) {
+    const character = getData().characters?.[key];
+    if (!character) return false;
+    const entry = entryFromGlobal(ensureAliases(character));
+    if (!entry) return false;
+    const base = chatBaseEntries();
+    const index = base.findIndex(item => item.name === entry.name);
+    if (index >= 0) base[index] = entry; else base.push(entry);
+    writeChatBase(base);
+    stripOpsEverywhere(entry.name);
+    return true;
+}
+
+/** 把一条 JSON 标记解析成计划（每个角色的最终 caption、nl、charRef、size）；不是 JSON 返回 null。 */
+function markerPlanFor(text, meta = {}) {
+    const payload = parseMarkerJson(text);
+    if (!payload) return null;
+    const floor = Number.isInteger(meta?.msgId) ? meta.msgId : ((ctx()?.chat?.length ?? 0) - 1);
+    const pos = Number.isFinite(meta?.pos) ? meta.pos : undefined;
+    const cast = currentCast();
+    const globals = allChars();
+    // 本聊天条目先与同名全局角色做字段级合并（外貌/描述/服装为空时回落全局，别名并集），$名字$ 展开与 JSON 查库都用合并结果。
+    const chatEntries = mergeChatEntriesWithGlobals(chatStateAt(floor, pos), globals);
+    const chatIndex = buildCharacterIndex([], [], chatEntries);
+    const globalIndex = buildCharacterIndex(cast, globals, []);
+    const lookup = name => {
+        const key = String(name ?? '').trim().toLowerCase();
+        const found = chatIndex.get(key) || globalIndex.get(key);
+        if (!found) return null;
+        return { tags: fixedTagsOf(found), nl: String(found.nl || '').trim(), charRef: String(found.charRef || '') };
+    };
+    const expand = value => expandCharacterRefs(value, {
+        chatEntries,
+        cast,
+        characters: globals,
+        enabled: true,
+        log: message => console.info(message),
+    });
+    return buildMarkerPlan(payload, { lookup, expand });
+}
+function planMarker(text, meta) { return markerPlanFor(text, meta); }
+
+/**
+ * 标记里的 $名字$：本楼的本聊天档案优先，其次出场全局角色，最后其余全局角色。
+ * meta.pos 是标记在消息里的起始位置，用来只应用它之前的 <外貌变化>。
+ * JSON 标记原样交给 generate（generate 里再解析），记录里存可读的 base + captions。
+ */
+function expandMarkerPrompt(text, meta = {}) {
+    const plan = markerPlanFor(text, meta);
+    if (plan) return { text: String(text), record: plan.recordPrompt };
+    const floor = Number.isInteger(meta?.msgId) ? meta.msgId : ((ctx()?.chat?.length ?? 0) - 1);
+    const pos = Number.isFinite(meta?.pos) ? meta.pos : undefined;
+    const globals = allChars();
+    return expandCharacterRefs(text, {
+        chatEntries: mergeChatEntriesWithGlobals(chatStateAt(floor, pos), globals),
+        cast: currentCast(),
+        characters: globals,
+        enabled: getData().options.markerCharExpand !== false,
+        log: message => console.info(message),
+    });
+}
+
+/** 世界书宏 {{zhiku_characters}} 的内容：本聊天角色（与全局同名条目字段级合并）+ 出场全局角色（锁定的标出来）。 */
+function characterMacroText() {
+    const base = chatBaseEntries();
+    return chatMacroText(chatLatest(), currentCast(), {
+        locked: lockedCharNames(getData().characters || {}, base),
+        globals: allChars(),
+    });
+}
+
+return { avatarUrl, stCards, allChars, mergedChatEntries, expandMarkerPrompt, planMarker, characterMacroText, chatBaseEntries, writeChatBase, chatStateAt, chatLatest, chatLockedNames, applyCharacterBlocks, invalidateCharState, saveChatEntry, deleteChatEntry, chatEntryRollback, promoteChatEntry, copyGlobalToChat, stPersonas, currentPersonaKey, getChar, saveChar, descOf, sideKicks, addSideKick, deleteChar, chatId, currentCast, removeFromCast, setCastOn, tagText, currentOutfit, fixedTags, canSplit, buildChatPrompt, previewCast, generateForMessage, insertImage, parsePairs, freeChars, saveCharacterPost, outfitFromPost, characterPayload, importZhihuijiCharacters, copyLook, wardrobe, findOutfit, giveOutfit, deleteOutfit };
 })();
 
 // ───── ui.js ─────
@@ -2228,6 +3488,8 @@ return { avatarUrl, stCards, stPersonas, currentPersonaKey, getChar, saveChar, d
 const CHAT_IMG_PATTERN='<img\\b[^>]*(?:pc-chat-img|画师库生成)[^>]*>';
 const MARKER_REGEX_ID = '72c57f73-46af-46ac-a28e-bf31b131332a';
 const MARKER_DISPLAY_ID = '6ba93a8e-cabb-494c-a7e8-6c9dfcf5fb80';
+const CHAR_BLOCK_DISPLAY_ID = 'a7c1d9b4-2f5e-4c6a-9d31-8b0f4e2a5c77';
+const CHAR_BLOCK_RE_SOURCE = '<(?:人物|外貌变化)>[\\s\\S]*?<\\/(?:人物|外貌变化)>';
 function escapeMarker(value) { return value.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&'); }
 function markerPattern(start, end) { return escapeMarker(start) + '[\\s\\S]*?' + escapeMarker(end); }
 function parseImageMarkers(text, start, end) {
@@ -2240,7 +3502,7 @@ function parseImageMarkers(text, start, end) {
     }
     return result;
 }
-function createMarkerController({context,getData,generate,upload,notify,document:doc=globalThis.document}) {
+function createMarkerController({context,getData,generate,upload,notify,expandPrompt,document:doc=globalThis.document}) {
     let queue=Promise.resolve(), stopped=false;
     const pending=new WeakMap(), failed=new WeakMap();
     const imageBindings=new WeakSet(), overlays=new Set(), holds=new Set();
@@ -2255,11 +3517,13 @@ function createMarkerController({context,getData,generate,upload,notify,document
     }
     function syncRegex() {
         const c=context(), {start,end}=settings();
-        const rule={id:MARKER_REGEX_ID,scriptName:'智库 · 生图标记不发送',findRegex:'/'+(start&&end?'(?:'+markerPattern(start,end)+')|':'')+CHAT_IMG_PATTERN+'/g',replaceString:'',trimStrings:[],placement:[1,2],disabled:false,markdownOnly:false,promptOnly:true,runOnEdit:false,substituteRegex:0,minDepth:null,maxDepth:null};
+        const block='(?:'+CHAR_BLOCK_RE_SOURCE+')';
+        const rule={id:MARKER_REGEX_ID,scriptName:'智库 · 生图标记不发送',findRegex:'/'+(start&&end?'(?:'+markerPattern(start,end)+')|':'')+block+'|'+CHAT_IMG_PATTERN+'/g',replaceString:'',trimStrings:[],placement:[1,2],disabled:false,markdownOnly:false,promptOnly:true,runOnEdit:false,substituteRegex:0,minDepth:null,maxDepth:null};
         const rules=c.extensionSettings.regex ||= [];
         const display={...rule,id:MARKER_DISPLAY_ID,scriptName:'智库 · 生图标记折叠',findRegex:start&&end?'/'+escapeMarker(start)+'(?!\\s*'+escapeMarker(end)+')[\\s\\S]*?'+escapeMarker(end)+'/g':'/(?!)/g',markdownOnly:true,promptOnly:false,replaceString:'<div class="pc-marker-slot"><details><summary>图片提示词</summary></details><button type="button" class="pc-marker-generate">生成图片</button></div>'};
+        const charBlock={...rule,id:CHAR_BLOCK_DISPLAY_ID,scriptName:'智库 · 角色档案折叠',findRegex:'/'+block+'/g',markdownOnly:true,promptOnly:false,replaceString:'<div class="pc-marker-slot pc-char-slot"><details><summary>角色档案</summary><pre>$&</pre></details></div>'};
         let changed=false;
-        for(const item of [rule,display]) {
+        for(const item of [rule,display,charBlock]) {
             const index=rules.findIndex(r=>r.id===item.id);
             if(index>=0 && JSON.stringify(rules[index])===JSON.stringify(item))continue;
             if(index<0)rules.push(item);else rules[index]=item;
@@ -2412,12 +3676,18 @@ function createMarkerController({context,getData,generate,upload,notify,document
                 if(!current())return 0;
                 entry.state='生成中…';decorate(id);
                 try {
-                    const prompt=promptOverride??msg.extra?.zhikuImages?.[key]?.prompt??token.prompt;
-                    const image=await generate(prompt);if(!current())return 0;
+                    // $名字$ / JSON 标记在发给 NovelAI 之前处理（带上本楼楼层号与本标记在消息里的起始位置：本聊天库按楼层重放，<外貌变化> 按位置生效）；消息原文不动。
+                    // expandPrompt 可以返回字符串，也可以返回 { text, record }（JSON 标记用：text 是原 JSON，record 是可读提示词）。
+                    const rawPrompt=promptOverride??msg.extra?.zhikuImages?.[key]?.prompt??token.prompt;
+                    const markerMeta={msgId:Number(id),key,swipe,pos:token.index};
+                    const resolved=typeof expandPrompt==='function'?expandPrompt(rawPrompt,markerMeta):rawPrompt;
+                    const prompt=resolved&&typeof resolved==='object'&&resolved.text!==undefined?String(resolved.text):String(resolved??rawPrompt);
+                    const recordPrompt=resolved&&typeof resolved==='object'&&resolved.record!==undefined?String(resolved.record):prompt;
+                    const image=await generate(prompt,markerMeta);if(!current())return 0;
                     entry.state='保存中…';decorate(id);
                     const {url}=await upload(image,'marker_'+Date.now());if(!current())return 0;
                     if(!url)throw new Error('图片上传未返回地址');
-                    const hadExtra=!!msg.extra;msg.extra ||= {};const hadRecords=!!msg.extra.zhikuImages,records=msg.extra.zhikuImages ||= {},old=records[key];records[key]={url:String(url),prompt};
+                    const hadExtra=!!msg.extra;msg.extra ||= {};const hadRecords=!!msg.extra.zhikuImages,records=msg.extra.zhikuImages ||= {},old=records[key];records[key]={url:String(url),prompt:recordPrompt};
                     try{await c.saveChat();}catch(e){if(old)records[key]=old;else delete records[key];if(!hadRecords&&!Object.keys(records).length)delete msg.extra.zhikuImages;if(!hadExtra&&!Object.keys(msg.extra).length)delete msg.extra;throw e;}
                     failed.get(msg)?.delete(key);return 1;
                 }catch(e){let errors=failed.get(msg);if(!errors){errors=new Set();failed.set(msg,errors);}errors.add(key);notify(e.message||String(e),'error');return 0;}
@@ -2430,8 +3700,30 @@ function createMarkerController({context,getData,generate,upload,notify,document
 }
 
 const __mod_marker=createMarkerController({
-        context:()=>SillyTavern.getContext(),getData:__mod_store.getData,document:DOC,
-        generate:async prompt=>{const d=__mod_store.getData();const {positive,negative}=__mod_engine.composeStudio({pos:__mod_model.mergeTags(d.active?__mod_model.ticketString(d,d.active):'',prompt),neg:[d.active?__mod_model.ticketNeg(d,d.active):'',d.options.chatNegative||''].filter(Boolean).join(', ')});const bound=[...new Set(__mod_chars.currentCast().filter(x=>x.on).map(x=>x.char.charRef).filter(id=>id&&d.charRefGroups?.[id]))];const image=await __mod_engine.generateFull({positive,negative,director:bound.length?await __mod_engine.charRefs(bound):undefined});__mod_engine.afterChatImage();return image;},
+        context:()=>SillyTavern.getContext(),getData:__mod_store.getData,expandPrompt:(prompt,meta)=>__mod_chars.expandMarkerPrompt(prompt,meta),document:DOC,
+        generate:async (prompt,meta)=>{
+            const d=__mod_store.getData();
+            const plan=__mod_chars.planMarker(prompt,meta);
+            const base=plan?plan.base:prompt;
+            const {positive,negative}=__mod_engine.composeStudio({pos:__mod_model.mergeTags(d.active?__mod_model.ticketString(d,d.active):'',base),neg:[d.active?__mod_model.ticketNeg(d,d.active):'',d.options.chatNegative||''].filter(Boolean).join(', ')});
+            let finalPositive=positive;
+            let chars=plan?plan.characters.map(entry=>({prompt:entry.caption,uc:''})):[];
+            let width;
+            let height;
+            if(plan){
+                const nai=__mod_nai.settings();
+                if(String(nai.novelaimode)==='nai-diffusion-3'||nai.naiMode==='tavern'){
+                    finalPositive=__mod_model.mergeTags(positive,...chars.map(entry=>entry.prompt));
+                    chars=[];
+                }
+                const swapped=swapSizeForOrientation(plan.size,Number(nai.novelai_width),Number(nai.novelai_height));
+                if(swapped.width){ width=swapped.width; height=swapped.height; }
+            }
+            const bound=[...new Set([...__mod_chars.currentCast().filter(x=>x.on).map(x=>x.char.charRef),...(plan?plan.charRefs:[])].filter(id=>id&&d.charRefGroups?.[id]))];
+            const image=await __mod_engine.generateFull({positive:finalPositive,negative,chars,width,height,director:bound.length?await __mod_engine.charRefs(bound):undefined});
+            __mod_engine.afterChatImage();
+            return image;
+        },
         upload:__mod_store.uploadImage,notify:(message,level)=>toastr[level]?.(message,'智库 · 标记生图')
     });
 const __mod_ui = (() => {
@@ -2532,7 +3824,7 @@ function render() {
     const body = root.querySelector('.pc-body');
     const scroll = body ? body.scrollTop : 0;
     const navs = [['studio', '生图'], ['book', '画师库'], ['vibe', '氛围'], ['cast', '角色'], ['lobby', '共享']];
-    const mainView = ['artist', 'group', 'batch'].includes(ui.view) ? 'book' : ['charedit', 'outfit'].includes(ui.view) ? 'cast' : ui.view;
+    const mainView = ['artist', 'group', 'batch'].includes(ui.view) ? 'book' : ['charedit', 'outfit', 'chatlib', 'charhist'].includes(ui.view) ? 'cast' : ui.view;
     root.innerHTML = `
     <div class="pc-shell">
       <header class="pc-head">
@@ -3547,7 +4839,11 @@ function viewCast(d) {
       </div>
       ${chars.length ? '<button class="pc-btn dark pc-mt-s" data-act="outdesign" style="width:100%">✦ 按剧情设计服装</button>' : ''}
       ${ui.castPreview ? `<div class="pc-mt-s">${C.previewCast().map(p => `<div class="pc-label">${esc(p.name)}${p.story ? '（衣服由 AI 按剧情写）' : ''}</div><p class="pc-quote small mono">${esc(p.tags) || '（没有外貌）'}</p>`).join('') || '<div class="pc-dim small">没有开着的角色</div>'}
-        <div class="pc-hint">再加上：当前画师串、AI 按剧情写的场景和动作、质量词。</div></div>` : ''}
+        <div class="pc-hint">标记里写 $名字$，会展开成对应角色的固定外貌（本聊天档案按楼层生效）。再加上：当前画师串、AI 按剧情写的场景和动作、质量词。</div></div>` : ''}
+    </section>
+    <section class="pc-card pc-pad pc-mt">
+      <div class="pc-row-between"><b>本聊天角色</b><button class="pc-pill dashed tiny" data-act="openchatlib">管理</button></div>
+      <div class="pc-dim small">AI 用 &lt;人物&gt; 建档、&lt;外貌变化&gt; 改档，按楼层生效；这里是最新状态。</div>
     </section>
     <div class="pc-seg three pc-mt">
       <button class="${ui.castTab === 'char' ? 'on' : ''}" data-act="casttab" data-tab="char">角色卡（char）· ${C.stCards().length}</button>
@@ -3659,10 +4955,16 @@ function viewCharEdit(d) {
 
     ${castRow ? `<section class="pc-card pc-pad pc-mt"><div class="pc-row-between"><b>这次聊天</b>${sw2(castRow.on, `data-cast="${esc(c.key)}"`)}</div><div class="pc-dim small">开着 = 聊天里生图时带上${esc(c.name)}</div></section>` : ''}
 
+    <section class="pc-card pc-pad pc-mt">
+      <label class="pc-field"><span>别名（| 或逗号分隔）</span><input class="pc-input" data-charaliases value="${esc(charAliasText(c))}" placeholder="小雪|Shirley"></label>
+      <div class="pc-hint">生图标记里写 $名字$ 或别名，会展开成上面「固定外貌」那一串。</div>
+      <label class="pc-field"><span>描述 nl（英文自然语言，可空）</span><textarea class="pc-textarea small" data-charnl rows="2" placeholder="a girl with long black hair and blue eyes">${esc(c.nl || '')}</textarea></label>
+      <div class="pc-hint">只用于 JSON 标记：接在该角色 caption 的 tag 之后、AI 写的 nl 之前；纯文本 $名字$ 只展开 tag，不带描述。</div>
+    </section>
     <details class="pc-fold"><summary><b>不想出现的</b><i>${esc(c.negative) || '这个角色专用的负面词'}</i></summary><div class="pc-fold-in">
       <textarea class="pc-textarea small mono" data-charneg placeholder="比如 beard, glasses">${esc(c.negative)}</textarea></div></details>
     <details class="pc-fold"><summary><b>会发送的内容</b><i>${esc(C.fixedTags(c)) || '（空）'}</i></summary><div class="pc-fold-in">
-      <p class="pc-quote small mono">${esc(C.fixedTags(c)) || '（空）'}</p><div class="pc-hint">聊天生图时，再加上 AI 写的动作表情${c.outfitMode === 'story' ? '和衣服' : ''}。</div></div></details>
+      <p class="pc-quote small mono">${esc(C.fixedTags(c)) || '（空）'}</p><div class="pc-hint">标记里写 $名字$ 或别名会展开成这一串；聊天生图时，再加上 AI 写的动作表情${c.outfitMode === 'story' ? '和衣服' : ''}。</div></div></details>
     <div class="pc-center pc-mt"><button class="pc-btn dark" data-act="chartest" ${busy ? 'disabled' : ''}>${busy === 'test' ? '<span class="pc-busy">生成中</span>' : `用${esc(c.name)}生成一张试试`}</button></div>
     ${ui.charTestImg ? `<section class="pc-card pc-mt pc-result"><img src="${esc(ui.charTestImg)}" alt="" data-act="viewimg" data-src="${esc(ui.charTestImg)}"></section>` : ''}
     <div class="pc-center pc-mt"><button class="pc-pill dashed" data-act="sharechar">分享这个角色</button></div>
@@ -3670,10 +4972,76 @@ function viewCharEdit(d) {
     <div style="height:24px"></div>`;
 }
 
+function saveManualChatEntry(input, oldName, previous) {
+    const name = String(input.name || '').trim();
+    if (!name) return false;
+    const tags = pairsFromTags(input.appearance || '');
+    const outfitTags = pairsFromTags(input.outfit || '');
+    const id = 'o_manual_' + Date.now();
+    // 衣服没改就保持原来的「是否显式」状态（继续沿用全局）；改了（含清空）才算显式覆盖。
+    const previousOutfit = previous && previous.outfitMode === 'fixed' ? tagsText(C.currentOutfit(previous)?.tags) : '';
+    const outfitChanged = tagsText(outfitTags) !== previousOutfit;
+    const ok = C.saveChatEntry({
+        name,
+        aliases: splitAliases(input.aliases !== undefined ? input.aliases : (previous ? previous.aliases : '')),
+        appearance: tags,
+        nl: String(input.nl || '').trim(),
+        outfitMode: outfitTags.length ? 'fixed' : 'story',
+        outfitModeExplicit: outfitChanged ? true : previous?.outfitModeExplicit === true,
+        outfits: outfitTags.length ? [{ id, name: '固定着装', tags: outfitTags }] : [],
+        outfitId: outfitTags.length ? id : '',
+    }, oldName || name);
+    if (ok) { toastr.success('已保存 ' + name, '角色档案'); render(); }
+    else toastr.warning('保存失败：名字不能为空', '角色档案');
+    return ok;
+}
+
 async function charAction(act, el) {
     const c = C.getChar(ui.charKey);
     const d = getData();
     switch (act) {
+        case 'openchatlib': ui.view = 'chatlib'; render(); root.querySelector('.pc-body')?.scrollTo(0, 0); return true;
+        case 'chatlibhist': ui.chatHistName = el.dataset.name; ui.view = 'charhist'; render(); return true;
+        case 'chatlibnew': {
+            const name = await promptText('新角色名？', '');
+            if (!name) return true;
+            const appearance = await promptText('外貌标签（英文逗号分隔；同名全局角色存在时可留空=沿用全局）', '', true);
+            const nl = await promptText('描述 nl（英文自然语言，可留空）', '', true);
+            const outfit = await promptText('固定衣服（留空=跟剧情/沿用全局）', '', true);
+            saveManualChatEntry({ name, appearance, nl, outfit }, name, null);
+            return true;
+        }
+        case 'chatlibedit': {
+            const entry = C.chatLatest().find(e => e.name === el.dataset.name) || C.chatBaseEntries().find(e => e.name === el.dataset.name);
+            if (!entry) return true;
+            const name = await promptText('名字', entry.name);
+            if (!name) return true;
+            const aliases = await promptText('别名（| 或逗号分隔）', (entry.aliases || []).join('|'));
+            const appearance = await promptText('外貌标签（英文逗号分隔；留空=沿用同名全局角色）', C.tagText(entry.appearance), true);
+            const nl = await promptText('描述 nl（英文自然语言；留空=沿用同名全局角色）', entry.nl || '', true);
+            const outfit = await promptText('固定衣服（留空=跟剧情/沿用全局）', entry.outfitMode === 'fixed' ? C.tagText(C.currentOutfit(entry)?.tags) : '', true);
+            saveManualChatEntry({ name, aliases, appearance, nl, outfit }, el.dataset.name, entry);
+            return true;
+        }
+        case 'chatlibrollback': {
+            if (C.chatEntryRollback(el.dataset.name, Number(el.dataset.index))) { toastr.success('已回到所选档案', '角色档案'); ui.view = 'chatlib'; render(); }
+            return true;
+        }
+        case 'chatlibdel': {
+            if (await confirmBox(`删除本聊天角色「${el.dataset.name}」？这个名字早先楼层的自动变更记录也会清掉。`)) {
+                C.deleteChatEntry(el.dataset.name); render(); toastr.success('已删除', '角色档案');
+            }
+            return true;
+        }
+        case 'chatlibpromote': {
+            if (!(await confirmBox(`把「${el.dataset.name}」提升为全局角色？之后所有聊天都能用，AI 不再修改它。`))) return true;
+            if (C.promoteChatEntry(el.dataset.name)) { render(); toastr.success('已提升为全局角色', '角色档案'); }
+            return true;
+        }
+        case 'chatlibcopy': {
+            if (C.copyGlobalToChat(el.dataset.key)) { render(); toastr.success('已复制到本聊天，AI 可以改它了', '角色档案'); }
+            return true;
+        }
         case 'openchar': ui.charKey = el.dataset.key; ui.view = 'charedit'; ui.charTestImg = ''; ui.outTestImg = ''; render(); root.querySelector('.pc-body')?.scrollTo(0, 0); return true;
         case 'casttab': ui.castTab = el.dataset.tab; render(); return true;
         case 'castpreview': ui.castPreview = !ui.castPreview; render(); return true;
@@ -4364,10 +5732,45 @@ function viewSettings(d) {
         <div class="pc-actions wrap"><a class="pc-btn dark" href="https://github.com/ruoege49-ship-it/zhiku-tavern-helper" target="_blank" rel="noopener">仓库 / 更新</a><a class="pc-btn" href="https://github.com/damoshen123/st-chatu8" target="_blank" rel="noopener">智绘姬原仓库</a></div></div>
       <div class="pc-about-note">看图提取需要能识图的模型 · 原脚本 AFPL v9，署名保留</div>`);
 
-    return `<h2 class="pc-pagetitle">设置</h2><div class="pc-marker-primary" style="padding:16px;margin-bottom:16px;border-radius:14px;background:var(--SmartThemeBlurTintColor,rgba(128,128,128,.12))">${sw('markerAuto', '开启标记自动生图', '默认开启 · 回复出现完整生图标记时自动生成，提示词默认折叠')}</div>${chat}${nai}${ai}${tpl}${entry}${share}${ban}${data}${about}<div style="height:24px"></div>`;
+    return `<h2 class="pc-pagetitle">设置</h2><div class="pc-marker-primary" style="padding:16px;margin-bottom:16px;border-radius:14px;background:var(--SmartThemeBlurTintColor,rgba(128,128,128,.12))">${sw('markerAuto', '开启标记自动生图', '默认开启 · 回复出现完整生图标记时自动生成，提示词默认折叠')}${sw('markerCharExpand', '标记里展开 $角色名$', '把 $名字$ 换成该角色的固定外貌（外貌 tag + 固定衣服）')}${sw('charAutoBlocks', '从回复自动建档 / 记录外貌变化', '解析回复里的 &lt;人物&gt; / &lt;外貌变化&gt;，按楼层生效')}${sw('charBlockToast', '建档时提示', '每楼最多一条小提示')}</div>${chat}${nai}${ai}${tpl}${entry}${share}${ban}${data}${about}<div style="height:24px"></div>`;
 }
 
-const VIEWS = { cast: viewCast, charedit: viewCharEdit, outfit: viewOutfit, studio: viewStudio, book: viewBook, artist: viewArtist, group: viewGroup, batch: viewBatch, vibe: viewVibe, lobby: viewLobby, settings: viewSettings };
+function viewChatLib() {
+    const d = getData();
+    const merged = C.mergedChatEntries();
+    const locked = C.chatLockedNames();
+    const srcTag = (sources, key) => sources[key] === 'global' ? '（来自全局）' : sources[key] === 'union' ? '（合并）' : '';
+    const rows = merged.map(({ entry, sources }) => `<div class="pc-who">
+      <div class="pc-grow"><b>${esc(entry.name)}</b><small>${entry.source === 'ai' ? 'AI 建档' : '手动'} · ${esc(C.tagText(entry.appearance)) || '（没有外貌）'}${entry.outfitMode === 'fixed' ? ` · 固定衣服${srcTag(sources, 'outfit')}` : ''}${entry.nl ? ` · 描述${srcTag(sources, 'nl')}` : ''}${sources.aliases === 'union' ? ' · 别名（合并）' : ''}</small></div>
+      <div class="pc-chips wrap">
+        <button class="pc-pill dashed tiny" data-act="chatlibedit" data-name="${esc(entry.name)}">编辑</button>
+        <button class="pc-pill dashed tiny" data-act="chatlibhist" data-name="${esc(entry.name)}">历史</button>
+        <button class="pc-pill dashed tiny" data-act="chatlibpromote" data-name="${esc(entry.name)}">提升为全局</button>
+        <button class="pc-pill dashed tiny danger" data-act="chatlibdel" data-name="${esc(entry.name)}">删除</button>
+      </div></div>`).join('');
+    const lockedRows = Object.values(d.characters || {}).filter(c => locked.has(c.name)).map(c => `<div class="pc-who">
+      <div class="pc-grow"><b>${esc(c.name)}</b><small>全局库 · 固定，不可改${c.nl ? ' · 有描述' : ''}</small></div>
+      <button class="pc-pill dashed tiny" data-act="chatlibcopy" data-key="${esc(c.key || '')}">复制到本聊天</button></div>`).join('');
+    return `<div class="pc-dhead"><button class="pc-round" data-act="nav" data-view="cast" aria-label="返回">‹</button><div class="pc-grow"><h2 class="pc-dtitle">本聊天角色</h2><div class="pc-tip" style="margin:0">按楼层重放：改档只影响它之后的楼层；空字段回落到同名全局角色。</div></div></div>
+    <section class="pc-card pc-pad pc-mt"><div class="pc-row-between"><b>本聊天档案</b><button class="pc-pill dashed tiny" data-act="chatlibnew">＋ 新建</button></div>
+    ${rows || '<div class="pc-dim small">还没有本聊天角色。AI 回复里写 &lt;人物&gt; 就会自动建档。</div>'}</section>
+    <section class="pc-card pc-pad pc-mt"><b>全局角色（固定）</b><div class="pc-dim small">AI 不会改全局角色；想要它在本聊天可改，就复制一份到本聊天。</div>${lockedRows || '<div class="pc-dim small">没有全局角色</div>'}</section>
+    <div style="height:24px"></div>`;
+}
+
+function viewChatHist() {
+    const entry = C.chatLatest().find(e => e.name === ui.chatHistName) || C.chatBaseEntries().find(e => e.name === ui.chatHistName);
+    const history = entry?.history || [];
+    const FIELD = { new: '建档', appearance: '外貌', outfit: '服装', nl: '描述', manual: '手动' };
+    const rows = history.map((h, i) => `<div class="pc-who">
+      <div class="pc-grow"><b>${h.floor >= 0 ? `第 ${h.floor + 1} 楼` : '手动'} · ${esc(h.reason || '变化')} · ${FIELD[h.field] || esc(h.field)}</b><small>${esc(h.from || '（无）')} → ${esc(h.to || '（无）')}</small></div>
+      <button class="pc-pill dashed tiny" data-act="chatlibrollback" data-name="${esc(entry.name)}" data-index="${i}">回到这里</button></div>`).join('');
+    return `<div class="pc-dhead"><button class="pc-round" data-act="nav" data-view="chatlib" aria-label="返回">‹</button><div class="pc-grow"><h2 class="pc-dtitle">${esc(ui.chatHistName || '')} · 档案历史</h2></div></div>
+    <section class="pc-card pc-pad pc-mt">${rows || '<div class="pc-dim small">还没有记录。</div>'}</section>
+    <div class="pc-hint">「回到这里」会把当时的字段写成手动值（手动值优先，AI 之后的改动仍会记在历史里）。</div>`;
+}
+
+const VIEWS = { cast: viewCast, chatlib: viewChatLib, charhist: viewChatHist, charedit: viewCharEdit, outfit: viewOutfit, studio: viewStudio, book: viewBook, artist: viewArtist, group: viewGroup, batch: viewBatch, vibe: viewVibe, lobby: viewLobby, settings: viewSettings };
 
 // ═════════════════════ 事件 ═════════════════════
 
@@ -4882,6 +6285,8 @@ function onInput(ev) {
         else { const h = u && C.findOutfit(u.owner, u.id); if (h) { h.o.name = el.value.trim(); if (h.owner) C.saveChar(h.owner); else commit({ silent: true }); } }
         return;
     }
+    if (el.dataset.charaliases !== undefined) { const c = C.getChar(ui.charKey); if (c) { c.aliases = splitAliases(el.value); C.saveChar(c); } return; }
+    if (el.dataset.charnl !== undefined) { const c = C.getChar(ui.charKey); if (c) { c.nl = el.value.trim(); C.saveChar(c); } return; }
     if (el.dataset.charneg !== undefined) { const c = C.getChar(ui.charKey); if (c) { c.negative = el.value; C.saveChar(c); } return; }
     if (el.dataset.bindGroup) { d.groups[el.dataset.bindGroup][el.dataset.field] = el.value; commit({ silent: true }); return; }
     if (el.dataset.crstr !== undefined) {
@@ -5836,6 +7241,15 @@ async function start() {
     DOC.head.appendChild(markerStyle);cleanups.push(()=>markerStyle.remove());
     await loadData();
     if (getData().options.markerAuto === undefined) getData().options.markerAuto = true;
+    if (getData().options.markerCharExpand === undefined) getData().options.markerCharExpand = true;
+    if (getData().options.charAutoBlocks === undefined) getData().options.charAutoBlocks = true;
+    if (getData().options.charBlockToast === undefined) getData().options.charBlockToast = true;
+    __mod_chars.invalidateCharState();
+    const charMacro = installCharMacro(SillyTavern.getContext(), {
+        text: () => __mod_chars.characterMacroText(),
+        log: message => console.warn(message),
+    });
+    cleanups.push(() => charMacro.uninstall());
     __mod_marker.syncRegex();
     setTimeout(() => __mod_marker.refresh(), 0);
     setTimeout(() => __mod_marker.refresh(), 0);
@@ -5852,17 +7266,20 @@ async function start() {
     UI.renderStub();
     cleanups.push(onChange(() => { UI.renderChip(); UI.renderStub(); }));
 
-    const onChat = () => setTimeout(() => { UI.renderChip(); UI.renderStub(); E.applyBindingOnChatChange(); addMesButtons(); }, 300);
+    const onChat = () => setTimeout(() => { __mod_chars.invalidateCharState(); UI.renderChip(); UI.renderStub(); E.applyBindingOnChatChange(); addMesButtons(); }, 300);
     DOC.addEventListener('click', onChatClick, true);
     cleanups.push(() => { DOC.removeEventListener('click', onChatClick, true); DOC.querySelectorAll('.pc-mes-gen, .pc-mes-outfit').forEach(n => n.remove()); });
     const onRendered = id => { setTimeout(addMesButtons, 50); };
     const onUserRendered = id => { onRendered(id); };
-    const onEdited = id => { onRendered(id); };
+    const onEdited = id => { onRendered(id); __mod_chars.invalidateCharState(); void __mod_chars.applyCharacterBlocks(Number(id)); };
+    const onSwiped = id => { __mod_chars.invalidateCharState(); void __mod_chars.applyCharacterBlocks(Number(id)); };
+    const onDeleted = () => { __mod_chars.invalidateCharState(); };
     const onCharMsg = id => {
         setTimeout(addMesButtons, 50);
+        setTimeout(() => { void __mod_chars.applyCharacterBlocks(Number(id)); }, 0);
         setTimeout(() => { void __mod_marker.process(Number(id)); }, 0);
     };
-    for (const [ev, fn] of [[event_types.USER_MESSAGE_RENDERED, onUserRendered], [event_types.CHARACTER_MESSAGE_RENDERED, onCharMsg], [event_types.MORE_MESSAGES_LOADED, onRendered], [event_types.MESSAGE_UPDATED, onEdited]]) {
+    for (const [ev, fn] of [[event_types.USER_MESSAGE_RENDERED, onUserRendered], [event_types.CHARACTER_MESSAGE_RENDERED, onCharMsg], [event_types.MORE_MESSAGES_LOADED, onRendered], [event_types.MESSAGE_UPDATED, onEdited], [event_types.MESSAGE_SWIPED, onSwiped], [event_types.MESSAGE_DELETED, onDeleted]]) {
         if (!ev) continue;
         eventSource.on(ev, fn);
         cleanups.push(() => eventSource.removeListener?.(ev, fn));

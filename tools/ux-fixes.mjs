@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import assert from 'node:assert/strict';
 
 export function applyUxFixes(s) {
-    const raw = fs.readFileSync(new URL('./ux-fixes.patch.txt', import.meta.url), 'utf8');
+    const raw = fs.readFileSync(new URL('./ux-fixes.patch.txt', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
     const blocks = raw.split(/^@@@ OLD.*\n/m).slice(1);
     assert(blocks.length > 10, 'ux-fixes.patch.txt 没读到补丁');
     for (const b of blocks) {
