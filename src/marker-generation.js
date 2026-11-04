@@ -20,6 +20,8 @@ export function parseImageMarkers(text, start, end) {
 export function createMarkerController({context,getData,generate,upload,notify,expandPrompt,document:doc=globalThis.document}) {
     let queue=Promise.resolve(), stopped=false;
     const pending=new WeakMap(), failed=new WeakMap();
+    // 这次刚生成出来的记录：只自动展开一次，重新打开聊天时仍按收起显示
+    const freshResults=new Set();
     const imageBindings=new WeakSet(), overlays=new Set(), holds=new Set();
     function settings() {
         const opts=getData().options;
@@ -28,6 +30,8 @@ export function createMarkerController({context,getData,generate,upload,notify,e
             start: String(opts.imageStartTag ?? old.startTag ?? 'image###'),
             end: String(opts.imageEndTag ?? old.endTag ?? '###'),
             auto: opts.markerAuto !== false,
+            // 生成完自动展开结果图（关掉就退回「点一下才展开」）
+            expand: opts.markerResultExpand !== false,
         };
     }
     function syncRegex() {
@@ -73,9 +77,14 @@ export function createMarkerController({context,getData,generate,upload,notify,e
             bindHold(button,edit);
             if(record?.url){
                 const wrapper=doc.createElement('details');wrapper.className='pc-result-collapse';
-                const header=doc.createElement('summary');header.textContent='图片 · 点击展开';
+                const header=doc.createElement('summary');
                 const img=doc.createElement('img');img.src=record.url;img.className='pc-result-image';img.alt='生成图片';
                 wrapper.append(header,img);slot.append(wrapper);
+                // 「生成后自动展开」：只对这次刚生成的那张生效，历史图片仍旧收起
+                const fresh=freshResults.delete(recordKey(msg,token)),autoOpen=cfg.expand&&fresh;
+                const syncHeader=()=>{header.textContent=wrapper.open?'图片 · 点击收起':'图片 · 点击展开';};
+                if(autoOpen)wrapper.open=true;
+                syncHeader();wrapper.addEventListener('toggle',syncHeader);
                 img.addEventListener('click',ev=>{ev.preventDefault();ev.stopPropagation();if(!img._pcHeld)preview(id,msg,token,index,record);});
                 bindHold(img,edit);
                 button.textContent=label(msg,token,record);
@@ -204,12 +213,12 @@ export function createMarkerController({context,getData,generate,upload,notify,e
                     if(!url)throw new Error('图片上传未返回地址');
                     const hadExtra=!!msg.extra;msg.extra ||= {};const hadRecords=!!msg.extra.zhikuImages,records=msg.extra.zhikuImages ||= {},old=records[key];records[key]={url:String(url),prompt:recordPrompt};
                     try{await c.saveChat();}catch(e){if(old)records[key]=old;else delete records[key];if(!hadRecords&&!Object.keys(records).length)delete msg.extra.zhikuImages;if(!hadExtra&&!Object.keys(msg.extra).length)delete msg.extra;throw e;}
-                    failed.get(msg)?.delete(key);return 1;
+                    failed.get(msg)?.delete(key);freshResults.add(key);return 1;
                 }catch(e){let errors=failed.get(msg);if(!errors){errors=new Set();failed.set(msg,errors);}errors.add(key);notify(e.message||String(e),'error');return 0;}
             }).finally(()=>{map.delete(key);if(!map.size)pending.delete(msg);if(current())decorate(id);});
             entry.job=job;queue=job.catch(()=>{});return job;
         });
         decorate(id);return (await Promise.all(jobs)).reduce((a,b)=>a+b,0);
     }
-    return {settings,syncRegex,process,decorate,decorateAll,refresh,stop(){stopped=true;for(const timer of holds)clearTimeout(timer);holds.clear();for(const el of overlays)el.remove();overlays.clear();if(doc)doc.querySelectorAll('.pc-image-actions').forEach(el=>el.remove());},idle(){return queue;}};
+    return {settings,syncRegex,process,decorate,decorateAll,refresh,stop(){stopped=true;freshResults.clear();for(const timer of holds)clearTimeout(timer);holds.clear();for(const el of overlays)el.remove();overlays.clear();if(doc)doc.querySelectorAll('.pc-image-actions').forEach(el=>el.remove());},idle(){return queue;}};
 }

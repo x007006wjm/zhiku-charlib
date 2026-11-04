@@ -319,7 +319,8 @@ export function applyCharLibrary(source) {
         '            lobbyShowNsfw: false,\n'
         + '            markerCharExpand: true,   // 标记里展开 $角色名$（角色固定外貌）\n'
         + '            charAutoBlocks: true,     // 从回复的 <人物>/<外貌变化> 自动建档\n'
-        + '            charBlockToast: true,     // 建档/改档时每楼一条小提示\n',
+        + '            charBlockToast: true,     // 建档/改档时每楼一条小提示\n'
+        + '            markerResultExpand: true, // 生成完自动展开结果图\n',
         'options default');
 
     // ④ chars 模块：本聊天库 + 按楼层重放 + 块解析 + 展开 + 宏
@@ -349,6 +350,7 @@ export function applyCharLibrary(source) {
         + '    if (getData().options.markerCharExpand === undefined) getData().options.markerCharExpand = true;\n'
         + '    if (getData().options.charAutoBlocks === undefined) getData().options.charAutoBlocks = true;\n'
         + '    if (getData().options.charBlockToast === undefined) getData().options.charBlockToast = true;\n'
+        + '    if (getData().options.markerResultExpand === undefined) getData().options.markerResultExpand = true;\n'
         + '    __mod_chars.invalidateCharState();\n'
         + '    const charMacro = installCharMacro(SillyTavern.getContext(), {\n'
         + '        text: () => __mod_chars.characterMacroText(),\n'
@@ -398,7 +400,8 @@ export function applyCharLibrary(source) {
     patch("${sw('markerCharExpand', '标记里展开 $角色名$', '把 $名字$ 换成该角色的固定外貌（外貌 tag + 固定衣服）')}</div>",
         "${sw('markerCharExpand', '标记里展开 $角色名$', '把 $名字$ 换成该角色的固定外貌（外貌 tag + 固定衣服）')}"
         + "${sw('charAutoBlocks', '从回复自动建档 / 记录外貌变化', '解析回复里的 &lt;人物&gt; / &lt;外貌变化&gt;，按楼层生效')}"
-        + "${sw('charBlockToast', '建档时提示', '每楼最多一条小提示')}</div>",
+        + "${sw('charBlockToast', '建档时提示', '每楼最多一条小提示')}"
+        + "${sw('markerResultExpand', '生成后自动展开图片', '默认开启 · 新生成的图片直接展开；历史图片仍然收起，点标题即可展开 / 收起')}</div>",
         'settings toggles');
 
     // ⑨ 角色页：别名输入 + 「会发送的内容」说明

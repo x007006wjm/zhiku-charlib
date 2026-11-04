@@ -90,6 +90,7 @@ function emptyData() {
             markerCharExpand: true,   // 标记里展开 $角色名$（角色固定外貌）
             charAutoBlocks: true,     // 从回复的 <人物>/<外貌变化> 自动建档
             charBlockToast: true,     // 建档/改档时每楼一条小提示
+            markerResultExpand: true, // 生成完自动展开结果图
         },
         lobby: { server: 'https://soundbox.192-255-236-219.sslip.io:8443/zhiku', nickname: '', invite: '' },
         characters: {},   // key -> 角色（见 chars.js）
@@ -3505,6 +3506,8 @@ function parseImageMarkers(text, start, end) {
 function createMarkerController({context,getData,generate,upload,notify,expandPrompt,document:doc=globalThis.document}) {
     let queue=Promise.resolve(), stopped=false;
     const pending=new WeakMap(), failed=new WeakMap();
+    // 这次刚生成出来的记录：只自动展开一次，重新打开聊天时仍按收起显示
+    const freshResults=new Set();
     const imageBindings=new WeakSet(), overlays=new Set(), holds=new Set();
     function settings() {
         const opts=getData().options;
@@ -3513,6 +3516,8 @@ function createMarkerController({context,getData,generate,upload,notify,expandPr
             start: String(opts.imageStartTag ?? old.startTag ?? 'image###'),
             end: String(opts.imageEndTag ?? old.endTag ?? '###'),
             auto: opts.markerAuto !== false,
+            // 生成完自动展开结果图（关掉就退回「点一下才展开」）
+            expand: opts.markerResultExpand !== false,
         };
     }
     function syncRegex() {
@@ -3558,9 +3563,14 @@ function createMarkerController({context,getData,generate,upload,notify,expandPr
             bindHold(button,edit);
             if(record?.url){
                 const wrapper=doc.createElement('details');wrapper.className='pc-result-collapse';
-                const header=doc.createElement('summary');header.textContent='图片 · 点击展开';
+                const header=doc.createElement('summary');
                 const img=doc.createElement('img');img.src=record.url;img.className='pc-result-image';img.alt='生成图片';
                 wrapper.append(header,img);slot.append(wrapper);
+                // 「生成后自动展开」：只对这次刚生成的那张生效，历史图片仍旧收起
+                const fresh=freshResults.delete(recordKey(msg,token)),autoOpen=cfg.expand&&fresh;
+                const syncHeader=()=>{header.textContent=wrapper.open?'图片 · 点击收起':'图片 · 点击展开';};
+                if(autoOpen)wrapper.open=true;
+                syncHeader();wrapper.addEventListener('toggle',syncHeader);
                 img.addEventListener('click',ev=>{ev.preventDefault();ev.stopPropagation();if(!img._pcHeld)preview(id,msg,token,index,record);});
                 bindHold(img,edit);
                 button.textContent=label(msg,token,record);
@@ -3689,14 +3699,14 @@ function createMarkerController({context,getData,generate,upload,notify,expandPr
                     if(!url)throw new Error('图片上传未返回地址');
                     const hadExtra=!!msg.extra;msg.extra ||= {};const hadRecords=!!msg.extra.zhikuImages,records=msg.extra.zhikuImages ||= {},old=records[key];records[key]={url:String(url),prompt:recordPrompt};
                     try{await c.saveChat();}catch(e){if(old)records[key]=old;else delete records[key];if(!hadRecords&&!Object.keys(records).length)delete msg.extra.zhikuImages;if(!hadExtra&&!Object.keys(msg.extra).length)delete msg.extra;throw e;}
-                    failed.get(msg)?.delete(key);return 1;
+                    failed.get(msg)?.delete(key);freshResults.add(key);return 1;
                 }catch(e){let errors=failed.get(msg);if(!errors){errors=new Set();failed.set(msg,errors);}errors.add(key);notify(e.message||String(e),'error');return 0;}
             }).finally(()=>{map.delete(key);if(!map.size)pending.delete(msg);if(current())decorate(id);});
             entry.job=job;queue=job.catch(()=>{});return job;
         });
         decorate(id);return (await Promise.all(jobs)).reduce((a,b)=>a+b,0);
     }
-    return {settings,syncRegex,process,decorate,decorateAll,refresh,stop(){stopped=true;for(const timer of holds)clearTimeout(timer);holds.clear();for(const el of overlays)el.remove();overlays.clear();if(doc)doc.querySelectorAll('.pc-image-actions').forEach(el=>el.remove());},idle(){return queue;}};
+    return {settings,syncRegex,process,decorate,decorateAll,refresh,stop(){stopped=true;freshResults.clear();for(const timer of holds)clearTimeout(timer);holds.clear();for(const el of overlays)el.remove();overlays.clear();if(doc)doc.querySelectorAll('.pc-image-actions').forEach(el=>el.remove());},idle(){return queue;}};
 }
 
 const __mod_marker=createMarkerController({
@@ -5732,7 +5742,7 @@ function viewSettings(d) {
         <div class="pc-actions wrap"><a class="pc-btn dark" href="https://github.com/ruoege49-ship-it/zhiku-tavern-helper" target="_blank" rel="noopener">仓库 / 更新</a><a class="pc-btn" href="https://github.com/damoshen123/st-chatu8" target="_blank" rel="noopener">智绘姬原仓库</a></div></div>
       <div class="pc-about-note">看图提取需要能识图的模型 · 原脚本 AFPL v9，署名保留</div>`);
 
-    return `<h2 class="pc-pagetitle">设置</h2><div class="pc-marker-primary" style="padding:16px;margin-bottom:16px;border-radius:14px;background:var(--SmartThemeBlurTintColor,rgba(128,128,128,.12))">${sw('markerAuto', '开启标记自动生图', '默认开启 · 回复出现完整生图标记时自动生成，提示词默认折叠')}${sw('markerCharExpand', '标记里展开 $角色名$', '把 $名字$ 换成该角色的固定外貌（外貌 tag + 固定衣服）')}${sw('charAutoBlocks', '从回复自动建档 / 记录外貌变化', '解析回复里的 &lt;人物&gt; / &lt;外貌变化&gt;，按楼层生效')}${sw('charBlockToast', '建档时提示', '每楼最多一条小提示')}</div>${chat}${nai}${ai}${tpl}${entry}${share}${ban}${data}${about}<div style="height:24px"></div>`;
+    return `<h2 class="pc-pagetitle">设置</h2><div class="pc-marker-primary" style="padding:16px;margin-bottom:16px;border-radius:14px;background:var(--SmartThemeBlurTintColor,rgba(128,128,128,.12))">${sw('markerAuto', '开启标记自动生图', '默认开启 · 回复出现完整生图标记时自动生成，提示词默认折叠')}${sw('markerCharExpand', '标记里展开 $角色名$', '把 $名字$ 换成该角色的固定外貌（外貌 tag + 固定衣服）')}${sw('charAutoBlocks', '从回复自动建档 / 记录外貌变化', '解析回复里的 &lt;人物&gt; / &lt;外貌变化&gt;，按楼层生效')}${sw('charBlockToast', '建档时提示', '每楼最多一条小提示')}${sw('markerResultExpand', '生成后自动展开图片', '默认开启 · 新生成的图片直接展开；历史图片仍然收起，点标题即可展开 / 收起')}</div>${chat}${nai}${ai}${tpl}${entry}${share}${ban}${data}${about}<div style="height:24px"></div>`;
 }
 
 function viewChatLib() {
@@ -7244,6 +7254,7 @@ async function start() {
     if (getData().options.markerCharExpand === undefined) getData().options.markerCharExpand = true;
     if (getData().options.charAutoBlocks === undefined) getData().options.charAutoBlocks = true;
     if (getData().options.charBlockToast === undefined) getData().options.charBlockToast = true;
+    if (getData().options.markerResultExpand === undefined) getData().options.markerResultExpand = true;
     __mod_chars.invalidateCharState();
     const charMacro = installCharMacro(SillyTavern.getContext(), {
         text: () => __mod_chars.characterMacroText(),
