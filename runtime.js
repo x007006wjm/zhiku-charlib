@@ -3764,7 +3764,7 @@ function createMarkerController({context,getData,generate,upload,notify,expandPr
             const ready=takePregen(id,msg,token);
             const job=(ready?.job||ready?.image||ready?.error?Promise.resolve(0):queue).then(async()=>{
                 if(!current())return 0;
-                entry.state=ready?'保存中…':'生成中…';decorate(id);
+                entry.state=ready?.image!==undefined?'保存中…':'生成中…';decorate(id);
                 try {
                     // $名字$ / JSON 标记在发给 NovelAI 之前处理（带上本楼楼层号与本标记在消息里的起始位置：本聊天库按楼层重放，<外貌变化> 按位置生效）；消息原文不动。
                     // expandPrompt 可以返回字符串，也可以返回 { text, record }（JSON 标记用：text 是原 JSON，record 是可读提示词）。
@@ -3773,13 +3773,10 @@ function createMarkerController({context,getData,generate,upload,notify,expandPr
                     const resolved=typeof expandPrompt==='function'?expandPrompt(rawPrompt,markerMeta):rawPrompt;
                     const prompt=resolved&&typeof resolved==='object'&&resolved.text!==undefined?String(resolved.text):String(resolved??rawPrompt);
                     const recordPrompt=resolved&&typeof resolved==='object'&&resolved.record!==undefined?String(resolved.record):prompt;
-                    let image;
-                    if(ready?.image!==undefined&&!promptOverride){image=ready.image;}
-                    else {
-                        if(ready?.job)await ready.job.catch(()=>{});
-                        if(ready?.image!==undefined&&!promptOverride){image=ready.image;}
-                        else {image=await generate(prompt,markerMeta);}
-                    }
+                    // 流式阶段已经出好的图直接用；没有（还在跑就等它跑完，失败了或用户改过提示词就重来）才请求。
+                    if(ready?.job)await ready.job.catch(()=>{});
+                    const reuse=ready?.image!==undefined&&!promptOverride;
+                    const image=reuse?ready.image:await generate(prompt,markerMeta);
                     if(!current())return 0;
                     entry.state='保存中…';decorate(id);
                     const {url}=await upload(image,'marker_'+Date.now());if(!current())return 0;
