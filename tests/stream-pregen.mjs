@@ -158,4 +158,32 @@ function setup({stream = true, reason = 'stream'} = {}) {
     controller.stop();
 }
 
-console.log('PASS: 流式预生成（未闭合不请求、闭合即请求、落地复用、开关关闭、重置、标记变化不复用）。');
+
+// 7) 流式阶段这条消息还没进 chat：照样先出图，落地时对得上
+{
+    const doc = makeDoc();
+    const data = {options: {}};
+    const chat = {chat: [], chatId: 'one', extensionSettings: {}, is_send_press: true,
+        saveSettingsDebounced() {}, async saveChat() {}, updateMessageBlock() {}};
+    let prompts = 0;
+    const state = {text: '正文 image###1boy, sunset###'};
+    const controller = createMarkerController({
+        context: () => chat, getData: () => data,
+        generate: async () => { prompts++; return 'data:image/png;base64,z'; },
+        upload: async () => ({url: '/user/images/z.png'}), notify() {},
+        getStreamingText: () => state.text, document: doc,
+    });
+    await controller.pregenSweep();
+    assert.equal(prompts, 1, '消息还没入 chat 时也要先出图');
+    await controller.idle();
+    const msg = {mes: '正文 image###1boy, sunset###', swipe_id: 0, swipes: []};
+    msg.swipes = [msg.mes];
+    chat.chat.push(msg);
+    chat.is_send_press = false;
+    const saved = await controller.process(0);
+    assert.equal(saved, 1, '落地后要写记录');
+    assert.equal(prompts, 1, '落地不能重复请求');
+    controller.stop();
+}
+
+console.log('PASS: 流式预生成（未闭合不请求、闭合即请求、落地复用、开关关闭、重置、标记变化不复用、消息未入 chat）。');

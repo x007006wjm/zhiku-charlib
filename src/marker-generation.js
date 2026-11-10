@@ -139,11 +139,19 @@ export function createMarkerController({context,getData,generate,upload,notify,e
         if(!cfg.auto||!cfg.stream)return 0;
         const text=streamBuffer();
         if(!text.includes(cfg.start))return 0;
-        const c=context(),chat=c.chat,msg=chat?.[chat.length-1];
-        if(!msg||msg.is_system||msg.is_user)return 0;
+        const c=context(),chat=c.chat||[];
+        // 流式阶段这条助手消息有时还没进 chat：它会落在 chat.length 这个位置，先按占位对象算好键，
+        // 等它真正出现时记录键（swipe 0 + 标记下标 + 标记原文）与楼层都对得上，图不会白生成。
+        let floor=chat.length-1,msg=chat[floor];
+        if(msg&&msg.is_system)return 0;
+        if(!msg||msg.is_user){
+            const generating=c.is_send_press||c.generating||c.streamingProcessor?.isStreaming;
+            if(!generating)return 0;
+            floor=chat.length;msg={swipe_id:0,mes:''};
+        }
         const tokens=closedMarkers(text,cfg);
         if(!tokens.length)return 0;
-        const chatId=chatKey(c),floor=chat.length-1;
+        const chatId=chatKey(c);
         let fired=0;
         for(const token of tokens){
             const key=recordKey(msg,token),slot=pregenSlot(chatId,floor,msg,token);
