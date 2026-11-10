@@ -320,7 +320,8 @@ export function applyCharLibrary(source) {
         + '            markerCharExpand: true,   // 标记里展开 $角色名$（角色固定外貌）\n'
         + '            charAutoBlocks: true,     // 从回复的 <人物>/<外貌变化> 自动建档\n'
         + '            charBlockToast: true,     // 建档/改档时每楼一条小提示\n'
-        + '            markerResultExpand: true, // 生成完自动展开结果图\n',
+        + '            markerResultExpand: true, // 生成完自动展开结果图\n'
+        + '            markerStream: true,       // 流式预生成：标记一成型就先出图\n',
         'options default');
 
     // ④ chars 模块：本聊天库 + 按楼层重放 + 块解析 + 展开 + 宏
@@ -351,6 +352,7 @@ export function applyCharLibrary(source) {
         + '    if (getData().options.charAutoBlocks === undefined) getData().options.charAutoBlocks = true;\n'
         + '    if (getData().options.charBlockToast === undefined) getData().options.charBlockToast = true;\n'
         + '    if (getData().options.markerResultExpand === undefined) getData().options.markerResultExpand = true;\n'
+        + '    if (getData().options.markerStream === undefined) getData().options.markerStream = true;\n'
         + '    __mod_chars.invalidateCharState();\n'
         + '    const charMacro = installCharMacro(SillyTavern.getContext(), {\n'
         + '        text: () => __mod_chars.characterMacroText(),\n'
@@ -360,8 +362,15 @@ export function applyCharLibrary(source) {
         'start macro');
 
     // ⑦ 标记生图：把 $名字$ 在 composeStudio/mergeTags 之前展开（带楼层）
+    // 流式预生成要读"正在流出来的那段文字"：宿主没有公开缓冲，就从最后一条消息的 DOM 里取
     patch('getData:__mod_store.getData,document:DOC,',
-        'getData:__mod_store.getData,expandPrompt:(prompt,meta)=>__mod_chars.expandMarkerPrompt(prompt,meta),document:DOC,',
+        'getData:__mod_store.getData,expandPrompt:(prompt,meta)=>__mod_chars.expandMarkerPrompt(prompt,meta),'
+        + 'getStreamingText:()=>{const c=SillyTavern.getContext();'
+        + 'const live=c.streamingProcessor?.messageText;if(typeof live==="string"&&live)return live;'
+        + 'const node=[...DOC.querySelectorAll("#chat .mes[mesid]")].pop();const body=node?.querySelector(".mes_text");'
+        + 'if(!body)return "";const clone=body.cloneNode(true);'
+        + 'clone.querySelectorAll(".pc-marker-slot,.pc-image-actions").forEach(el=>el.remove());'
+        + 'return clone.textContent||"";},document:DOC,',
         'marker expand wiring');
 
     // ⑦b JSON 标记：base + 每个角色的 caption 走 NovelAI 分角色（v3 / 酒馆代理回落到 base）；按 size 交换宽高；带上命中角色的 charRef
@@ -401,7 +410,8 @@ export function applyCharLibrary(source) {
         "${sw('markerCharExpand', '标记里展开 $角色名$', '把 $名字$ 换成该角色的固定外貌（外貌 tag + 固定衣服）')}"
         + "${sw('charAutoBlocks', '从回复自动建档 / 记录外貌变化', '解析回复里的 &lt;人物&gt; / &lt;外貌变化&gt;，按楼层生效')}"
         + "${sw('charBlockToast', '建档时提示', '每楼最多一条小提示')}"
-        + "${sw('markerResultExpand', '生成后自动展开图片', '默认开启 · 新生成的图片直接展开；历史图片仍然收起，点标题即可展开 / 收起')}</div>",
+        + "${sw('markerResultExpand', '生成后自动展开图片', '默认开启 · 新生成的图片直接展开；历史图片仍然收起，点标题即可展开 / 收起')}"
+        + "${sw('markerStream', '流式预生成', '默认开启 · 回复还在流、标记一写完整就先发生图请求，正文写完时图片往往已经好了')}</div>",
         'settings toggles');
 
     // ⑨ 角色页：别名输入 + 「会发送的内容」说明
@@ -533,6 +543,40 @@ async function charAction(act, el) {`,
     patch('[event_types.MESSAGE_UPDATED, onEdited]]) {',
         '[event_types.MESSAGE_UPDATED, onEdited], [event_types.MESSAGE_SWIPED, onSwiped], [event_types.MESSAGE_DELETED, onDeleted]]) {',
         'register swipe/delete');
+
+    // ⑫ 流式预生成：文字还在流的时候就看有没有已经闭合的标记，有就先发生图请求；
+    //    新一次生成开始时把上一次没落地的预生成结果丢掉（换 swipe / 重新生成时不能串图）。
+    patch('    eventSource.on(event_types.CHAT_CHANGED, onChat);',
+        `    if (event_types.STREAM_TOKEN_RECEIVED) {
+        let streamTimer = null, streamBusy = false;
+        const onStreamToken = () => {
+            if (streamTimer !== null) return;
+            streamTimer = setTimeout(() => {
+                streamTimer = null;
+                if (streamBusy) return;
+                streamBusy = true;
+                Promise.resolve(__mod_marker.pregenSweep?.()).catch(e => console.warn('[智库] 流式预生成', e)).finally(() => { streamBusy = false; });
+            }, 250);
+        };
+        eventSource.on(event_types.STREAM_TOKEN_RECEIVED, onStreamToken);
+        cleanups.push(() => { if (streamTimer !== null) clearTimeout(streamTimer); eventSource.removeListener?.(event_types.STREAM_TOKEN_RECEIVED, onStreamToken); });
+    } else {
+        // 宿主没有流式事件（旧版 / 换了实现）：退化成轮询，一样的 250ms 节流
+        const poll = setInterval(() => {
+            try {
+                const c = SillyTavern.getContext();
+                if (c.is_send_press || c.generating || c.streamingProcessor?.isStreaming) void __mod_marker.pregenSweep?.();
+            } catch (e) { /* 宿主没这个字段就算了 */ }
+        }, 400);
+        cleanups.push(() => clearInterval(poll));
+    }
+    if (event_types.GENERATION_STARTED) {
+        const onGenerationStarted = () => __mod_marker.pregenReset?.();
+        eventSource.on(event_types.GENERATION_STARTED, onGenerationStarted);
+        cleanups.push(() => eventSource.removeListener?.(event_types.GENERATION_STARTED, onGenerationStarted));
+    }
+    eventSource.on(event_types.CHAT_CHANGED, onChat);`,
+        'stream pregen events');
 
     return s;
 }
