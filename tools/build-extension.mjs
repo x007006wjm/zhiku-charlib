@@ -11,6 +11,7 @@ import {applyStudioUx} from './studio-ux.mjs';
 import {applyImageCharacters} from './image-characters.mjs';
 import {applyIllustrationPlans} from './illustration-plans.mjs';
 import {applyComic} from './comic.mjs';
+import {applyCharLibrary} from './apply-char-lib.mjs';
 import {fileURLToPath} from 'node:url';
 process.chdir(fileURLToPath(new URL('../', import.meta.url)));
 const dir='.';
@@ -2905,6 +2906,7 @@ patch(`    if (el.dataset.wardimg !== undefined || el.dataset.outimg !== undefin
 patch(`.pc-i2i{display:flex;gap:10px;align-items:flex-start}`,`.pc-i2i{display:flex;gap:10px;align-items:flex-start}
 .pc-castact{width:100%;box-sizing:border-box;margin-top:6px;padding:7px 12px;border-radius:12px;border:1.5px dashed var(--pc-dash);background:transparent;color:var(--pc-ink);font-size:12px}`);
 s=applyImg2imgCompatibility(s);
+s=applyCharLibrary(s);
 const prefix=`// Generated from the full script; edit build-extension.mjs and shared-upload.js.
 export function createRuntime() {
 let stopped = false;

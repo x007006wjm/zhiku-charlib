@@ -17,7 +17,7 @@ data.options=JSON.parse(JSON.stringify(data.options));
 assert.equal(controller.settings().imageExpanded,false,'collapsed preference survives serialization');
 data.options.imageExpanded=true;
 assert.equal(controller.settings().imageExpanded,true);
-assert.equal(c.extensionSettings.regex.length,3);
+assert.equal(c.extensionSettings.regex.length,4,'3 marker rules plus the character-block fold rule');
 let rule=c.extensionSettings.regex.find(r=>r.id===MARKER_REGEX_ID);
 assert(rule.promptOnly&&!rule.markdownOnly&&!rule.runOnEdit);assert.deepEqual(rule.placement,[1,2]);
 const regex=()=>new RegExp(rule.findRegex.slice(1,-2),'g');

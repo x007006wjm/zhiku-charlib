@@ -3,6 +3,8 @@
 export const CHAT_IMG_PATTERN='<img\\b[^>]*(?:pc-chat-img|画师库生成)[^>]*>';
 export const MARKER_REGEX_ID = '72c57f73-46af-46ac-a28e-bf31b131332a';
 export const MARKER_DISPLAY_ID = '6ba93a8e-cabb-494c-a7e8-6c9dfcf5fb80';
+export const CHAR_BLOCK_DISPLAY_ID = 'a7c1d9b4-2f5e-4c6a-9d31-8b0f4e2a5c77';
+export const CHAR_BLOCK_RE_SOURCE = '<(?:人物|外貌变化)>[\\s\\S]*?<\\/(?:人物|外貌变化)>';
 export function escapeMarker(value) { return value.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&'); }
 export function markerPattern(start, end) { return escapeMarker(start) + '[\\s\\S]*?' + escapeMarker(end); }
 export function parseImageMarkers(text, start, end) {
@@ -31,12 +33,16 @@ export function shiftImageRecords(records, tokens, swipe, shifts) {
     for(const [old,key]of moves)next[key]=records[old];
     return next;
 }
-export function createMarkerController({context,getData,generate,upload,notify,document:doc=globalThis.document,resolveUrl=u=>u}) {
+export function createMarkerController({context,getData,generate,upload,notify,expandPrompt,getStreamingText,document:doc=globalThis.document,resolveUrl=u=>u}) {
     // 图存在本地浏览器时地址是 idb:xxx，要先换成能显示的地址；换不出来（存在别的设备上）就是空的
     function showUrl(url,apply,missing){Promise.resolve(resolveUrl(url)).then(u=>{if(u)apply(u);else missing?.();},()=>missing?.());}
     let queue=Promise.resolve(), stopped=false;
     const pending=new WeakMap(), failed=new WeakMap();
     const imageBindings=new WeakSet(), overlays=new Set(), holds=new Set(), inflight=new Set(), keepOpen=new Set();
+    // 这次刚生成出来的记录：只自动展开一次，重新打开聊天时仍按收起显示
+    const freshResults=new Set();
+    // 流式预生成：chat|floor|swipe:index:raw -> {state,job,token,image,prompt,error,floor,chat}
+    const pregen=new Map();
     function settings() {
         const opts=getData().options;
         const old=context().extensionSettings['st-chatu8'] || {};
@@ -45,15 +51,22 @@ export function createMarkerController({context,getData,generate,upload,notify,d
             end: String(opts.imageEndTag ?? old.endTag ?? '###'),
             auto: opts.markerAuto !== false,
             imageExpanded: opts.imageExpanded !== false,
+            // 生成完自动展开结果图（关掉就退回「点一下才展开」）
+            expand: opts.markerResultExpand !== false,
+            // 流式预生成：回复还在流、标记一成型就先发生图请求
+            stream: opts.markerStream !== false,
         };
     }
     function syncRegex() {
         const c=context(), {start,end}=settings();
-        const rule={id:MARKER_REGEX_ID,scriptName:'智库 · 生图标记不发送',findRegex:'/'+(start&&end?'(?:'+markerPattern(start,end)+')|':'')+CHAT_IMG_PATTERN+'/g',replaceString:'',trimStrings:[],placement:[1,2],disabled:false,markdownOnly:false,promptOnly:true,runOnEdit:false,substituteRegex:0,minDepth:null,maxDepth:null};
+        const block='(?:'+CHAR_BLOCK_RE_SOURCE+')';
+        const rule={id:MARKER_REGEX_ID,scriptName:'智库 · 生图标记不发送',findRegex:'/'+(start&&end?'(?:'+markerPattern(start,end)+')|':'')+block+'|'+CHAT_IMG_PATTERN+'/g',replaceString:'',trimStrings:[],placement:[1,2],disabled:false,markdownOnly:false,promptOnly:true,runOnEdit:false,substituteRegex:0,minDepth:null,maxDepth:null};
         const rules=c.extensionSettings.regex ||= [];
         const display={...rule,id:MARKER_DISPLAY_ID,scriptName:'智库 · 生图标记折叠',findRegex:start&&end?'/'+escapeMarker(start)+'(?!\\s*'+escapeMarker(end)+')[\\s\\S]*?'+escapeMarker(end)+'/g':'/(?!)/g',markdownOnly:true,promptOnly:false,replaceString:'<div class="pc-marker-slot"><details><summary>图片提示词</summary></details><button type="button" class="pc-marker-generate">生成图片</button></div>'};
+        // 角色档案块（<人物> / <外貌变化>）既不发给聊天模型，也在正文里折起来
+        const charBlock={...rule,id:CHAR_BLOCK_DISPLAY_ID,scriptName:'智库 · 角色档案折叠',findRegex:'/'+block+'/g',markdownOnly:true,promptOnly:false,replaceString:'<div class="pc-marker-slot pc-char-slot"><details><summary>角色档案</summary><pre>$&</pre></details></div>'};
         let changed=false;
-        for(const item of [rule,display]) {
+        for(const item of [rule,display,charBlock]) {
             const index=rules.findIndex(r=>r.id===item.id);
             if(index>=0 && JSON.stringify(rules[index])===JSON.stringify(item))continue;
             if(index<0)rules.push(item);else rules[index]=item;
@@ -92,6 +105,9 @@ export function createMarkerController({context,getData,generate,upload,notify,d
             if(record?.url){
                 const wrapper=doc.createElement('details');wrapper.className='pc-result-collapse';
                 wrapper.open=cfg.imageExpanded;
+                // 「生成后自动展开」：只对这次刚生成的那张生效，历史图片仍按默认显示
+                const fresh=freshResults.delete(recordKey(msg,token));
+                if(cfg.expand&&fresh)wrapper.open=true;
                 const header=doc.createElement('summary');
                 let imageTitle='图片',imageMissing=false;
                 const syncTitle=()=>{if(!imageMissing)header.textContent=imageTitle+(wrapper.open?' · 点击折叠':' · 点击展开');};
@@ -119,6 +135,99 @@ export function createMarkerController({context,getData,generate,upload,notify,d
         });
     }
     function recordKey(msg,token){return String(msg.swipe_id??0)+':'+token.index+':'+token.raw;}
+    // ───────── 流式预生成 ─────────
+    // 回复还在流的时候标记就已经完整出现，这里先把这张图生成掉；
+    // 等消息真正落地时 process() 发现这条记录已经在手上，就直接复用，不再等。
+    // 按「聊天|楼层|标记」存，不按消息对象：宿主落地时可能换掉那个对象，按对象存会对不上、白生成一次。
+    function pregenSlot(chat,floor,msg,token){return chat+'|'+floor+'|'+recordKey(msg,token);}
+    /** 流式文本里已经闭合的标记（没闭合的不管：那时提示词还没写完） */
+    function closedMarkers(text,cfg){return parseImageMarkers(text,cfg.start,cfg.end);}
+    function streamBuffer(){return typeof getStreamingText==='function'?String(getStreamingText()||''):'';}
+    function pregenReset(){pregen.clear();}
+    /** 没人来取（被打断、消息没落地）的结果不会一直堆着：超过 8 条就丢掉已经跑完的那些，在跑的留着 */
+    function pregenPrune(){
+        if(pregen.size<=8)return;
+        for(const [slot,entry] of pregen){
+            if(pregen.size<=8)break;
+            if(!entry.job)pregen.delete(slot);
+        }
+    }
+    /** 把这一楼所有生图标记从正文里删掉，给结构化分镜当原句证据（算法与 process 里一致） */
+    function storyOf(source,all){
+        let story=source;
+        for(const marker of [...all].reverse())story=story.slice(0,marker.index)+story.slice(marker.index+marker.raw.length);
+        return story;
+    }
+    /** 提示词展开：expandPrompt 可以返回字符串，也可以返回 { text, record }（record 是可读版本，存进记录） */
+    function resolvePrompt(rawPrompt,meta){
+        const resolved=typeof expandPrompt==='function'?expandPrompt(rawPrompt,meta):rawPrompt;
+        const prompt=resolved&&typeof resolved==='object'&&resolved.text!==undefined?String(resolved.text):String(resolved??rawPrompt);
+        const record=resolved&&typeof resolved==='object'&&resolved.record!==undefined?String(resolved.record):prompt;
+        return {prompt,record};
+    }
+    async function pregenSweep(){
+        if(stopped)return 0;
+        const cfg=settings();
+        if(!cfg.auto||!cfg.stream)return 0;
+        const text=streamBuffer();
+        if(!text.includes(cfg.start))return 0;
+        const c=context(),chat=c.chat||[];
+        // 流式阶段这条助手消息有时还没进 chat：它会落在 chat.length 这个位置，先按占位对象算好键，
+        // 等它真正出现时记录键（swipe 0 + 标记下标 + 标记原文）与楼层都对得上，这张图就不会白生成。
+        let floor=chat.length-1,msg=chat[floor];
+        if(msg&&msg.is_system)return 0;
+        if(!msg||msg.is_user){
+            const generating=c.is_send_press||c.generating||c.streamingProcessor?.isStreaming;
+            if(!generating)return 0;
+            floor=chat.length;msg={swipe_id:0,mes:''};
+        }
+        const tokens=closedMarkers(text,cfg);
+        if(!tokens.length)return 0;
+        const chatId=chatKey(c);
+        const story=storyOf(text,tokens);
+        let fired=0;
+        for(const token of tokens){
+            const key=recordKey(msg,token),slot=pregenSlot(chatId,floor,msg,token);
+            if(pregen.has(slot))continue;
+            if(msg.extra?.zhikuImages?.[key])continue;
+            if(failed.get(msg)?.has(key))continue;
+            const entry={state:'预生成中…',job:null,token,raw:token.raw,key,floor,chat:chatId};
+            pregen.set(slot,entry);
+            entry.job=queue.then(async()=>{
+                if(stopped)return 0;
+                entry.state='生成中…';
+                const meta={msgId:floor,floor,key,swipe:msg.swipe_id,pos:token.index};
+                const resolved=resolvePrompt(token.prompt,meta);
+                entry.prompt=resolved.record;
+                entry.image=await generate(resolved.prompt,{...meta,story});
+                return 1;
+            }).catch(error=>{entry.error=error?.message||String(error);return 0;})
+              .finally(()=>{entry.job=null;});
+            queue=entry.job.catch(()=>{});
+            pregenPrune();
+            fired++;
+        }
+        return fired;
+    }
+    /**
+     * 取出流式阶段的成果并删掉它（只能取一次）。
+     * 先按「聊天|楼层|记录键」精确找；流式文本与落地文本偶尔有细微出入（多一个空格、标记位置挪了），
+     * 这时退一步按标记原文找同一楼的那条，别让已经生成好的图白扔。
+     */
+    function takePregen(id,msg,token){
+        if(!pregen.size)return null;
+        const chatId=chatKey(context()),floor=Number(id),slot=pregenSlot(chatId,floor,msg,token);
+        let hit=pregen.has(slot)?slot:null;
+        if(!hit){
+            for(const [k,entry] of pregen){
+                if(entry.floor===floor&&entry.chat===chatId&&entry.raw===token.raw){hit=k;break;}
+            }
+        }
+        if(!hit)return null;
+        const entry=pregen.get(hit);
+        pregen.delete(hit);
+        return entry;
+    }
     // 已经存的结果按「swipe + 标记原文」找：标记前面的文字被别的脚本改过、位置挪了，也认得出是同一张，不会再生成一次
     function findRecordKey(msg,token){
         const recs=msg.extra?.zhikuImages;if(!recs)return '';
@@ -250,34 +359,47 @@ export function createMarkerController({context,getData,generate,upload,notify,d
             // 酒馆把这一楼换成了新对象（重新加载、别的脚本改楼层）时，上面按对象记的排队查不到：再按楼层记一份，同一张不会同时生成两次
             const flight=chat+'|'+id+'|'+swipe+'|'+token.index+'|'+token.raw;
             if(inflight.has(flight))return Promise.resolve(0);
+            // 流式阶段可能已经先生成好了这张图：取出来直接用，不再排一次队
+            const ready=takePregen(id,msg,token);
             if(!map){map=new Map();pending.set(msg,map);}
             const entry={state:'排队中…',job:null};map.set(key,entry);inflight.add(flight);
             // 别的脚本改了这一楼其他地方（状态栏、正则）不算变：只要这个标记还在原位置，结果照样存
             const current=()=>!stopped&&chatKey(context())===chat&&context().chat?.[id]===msg&&msg.swipe_id===swipe&&String(msg.mes||'').slice(token.index,token.index+token.raw.length)===token.raw;
-            const job=queue.then(async()=>{
+            // 预生成已出图 / 正在生成 / 报过错，都不用再排队；只有都没有时才从队尾开始
+            const wait=ready?Promise.resolve(0):queue;
+            const job=wait.then(async()=>{
                 if(!current())return 0;
-                entry.state='生成中…';decorate(id);
+                entry.state=ready?.image!==undefined?'保存中…':'生成中…';decorate(id);
                 try {
-                    const prompt=promptOverride??findRecord(msg,token)?.prompt??token.prompt;
+                    const rawPrompt=promptOverride??findRecord(msg,token)?.prompt??token.prompt;
+                    const meta={msgId:Number(id),floor:Number(id),key,swipe,pos:token.index};
+                    const resolved=resolvePrompt(rawPrompt,meta);
+                    const prompt=resolved.prompt,recordPrompt=resolved.record;
                     // Story is only evidence for a structured shot's source quote, never a cast lookup.
                     let story=source;
                     for(const marker of [...all].reverse())story=story.slice(0,marker.index)+story.slice(marker.index+marker.raw.length);
-                    const image=await generate(prompt,{story});if(!current())return 0;
+                    if(ready?.job)await ready.job.catch(()=>{});
+                    if(!current())return 0;
+                    // 预生成已经给了图就直接用；只有用户在编辑框里改了提示词才重新生成
+                    const reuse=ready?.image!==undefined&&!promptOverride;
+                    const image=reuse?ready.image:await generate(prompt,{...meta,story});
+                    if(!current())return 0;
                     entry.state='保存中…';decorate(id);
                     const {url}=await upload(image,'marker_'+Date.now());if(!current())return 0;
                     if(!url)throw new Error('图片上传未返回地址');
                     const hadExtra=!!msg.extra;msg.extra ||= {};const hadRecords=!!msg.extra.zhikuImages,records=msg.extra.zhikuImages ||= {},old=records[key];
                     // 重新生成不覆盖：以前的版本留着，可以翻回去（最多 10 个）
                     const prevKey=findRecordKey(msg,token),prev=prevKey&&records[prevKey]?.url?records[prevKey]:null;
-                    const versions=[...(prev?.versions||(prev?[{url:prev.url,prompt:prev.prompt}]:[])),{url:String(url),prompt}].slice(-10);
-                    records[key]={url:String(url),prompt,versions};
+                    const versions=[...(prev?.versions||(prev?[{url:prev.url,prompt:prev.prompt}]:[])),{url:String(url),prompt:recordPrompt}].slice(-10);
+                    records[key]={url:String(url),prompt:recordPrompt,versions};
                     try{await c.saveChat();}catch(e){if(old)records[key]=old;else delete records[key];if(!hadRecords&&!Object.keys(records).length)delete msg.extra.zhikuImages;if(!hadExtra&&!Object.keys(msg.extra).length)delete msg.extra;throw e;}
-                    failed.get(msg)?.delete(key);return 1;
+                    failed.get(msg)?.delete(key);
+                    freshResults.add(key);return 1;
                 }catch(e){let errors=failed.get(msg);if(!errors){errors=new Set();failed.set(msg,errors);}errors.add(key);notify(e.message||String(e),'error');return 0;}
             }).finally(()=>{inflight.delete(flight);map.delete(key);if(!map.size)pending.delete(msg);if(!stopped&&chatKey(context())===chat)decorate(id);});
             entry.job=job;queue=job.catch(()=>{});return job;
         });
         decorate(id);return (await Promise.all(jobs)).reduce((a,b)=>a+b,0);
     }
-    return {settings,syncRegex,process,decorate,decorateAll,refresh,applyImageDefault,stop(){stopped=true;for(const timer of holds)clearTimeout(timer);holds.clear();for(const el of overlays)el.remove();overlays.clear();if(doc)doc.querySelectorAll('.pc-image-actions').forEach(el=>el.remove());},idle(){return queue;}};
+    return {settings,syncRegex,process,decorate,decorateAll,refresh,applyImageDefault,pregenSweep,pregenReset,stop(){stopped=true;freshResults.clear();pregenReset();for(const timer of holds)clearTimeout(timer);holds.clear();for(const el of overlays)el.remove();overlays.clear();if(doc)doc.querySelectorAll('.pc-image-actions').forEach(el=>el.remove());},idle(){return queue;}};
 }
