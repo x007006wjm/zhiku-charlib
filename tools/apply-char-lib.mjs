@@ -560,27 +560,33 @@ async function charAction(act, el) {`,
     //    新一次生成开始时把上一次没落地的预生成结果丢掉（换 swipe / 重新生成时不能串图）。
     patch('    eventSource.on(event_types.CHAT_CHANGED, onChat);',
         `    const streamEvent = event_types.STREAM_TOKEN_RECEIVED || 'stream_token_received';
-    let streamTimer = null, streamBusy = false, lastStreamText = '';
+    let streamTimer = null, streamBusy = false, streamClosed = false, lastStreamText = '';
+    const cancelStreamTimer = () => { if (streamTimer !== null) { clearTimeout(streamTimer); streamTimer = null; } };
     const onStreamToken = (payload) => {
+        if (streamClosed) return;
         const text = typeof payload === 'string' ? payload : (typeof payload?.text === 'string' ? payload.text : (typeof payload?.content === 'string' ? payload.content : ''));
         if (text) lastStreamText = text;
         if (streamTimer !== null) return;
         streamTimer = setTimeout(() => {
             streamTimer = null;
-            if (streamBusy) return;
+            if (streamBusy || streamClosed) return;
             streamBusy = true;
             const snap = lastStreamText;
             Promise.resolve(__mod_marker.pregenSweep?.(snap)).catch(e => console.warn('[智库] 流式预生成', e)).finally(() => { streamBusy = false; });
         }, 180);
     };
     eventSource.on(streamEvent, onStreamToken);
-    cleanups.push(() => { if (streamTimer !== null) clearTimeout(streamTimer); eventSource.removeListener?.(streamEvent, onStreamToken); });
+    cleanups.push(() => { cancelStreamTimer(); eventSource.removeListener?.(streamEvent, onStreamToken); });
     const genStartEvent = event_types.GENERATION_STARTED || 'generation_started';
-    const onGenerationStarted = () => { lastStreamText = ''; __mod_marker.pregenReset?.(); };
+    const onGenerationStarted = () => { streamClosed = false; cancelStreamTimer(); lastStreamText = ''; __mod_marker.pregenReset?.(); };
     eventSource.on(genStartEvent, onGenerationStarted);
     cleanups.push(() => eventSource.removeListener?.(genStartEvent, onGenerationStarted));
+    const genEndEvent = event_types.GENERATION_ENDED || 'generation_ended';
+    const onGenerationEnded = () => { streamClosed = true; cancelStreamTimer(); lastStreamText = ''; };
+    eventSource.on(genEndEvent, onGenerationEnded);
+    cleanups.push(() => eventSource.removeListener?.(genEndEvent, onGenerationEnded));
     const genStopEvent = event_types.GENERATION_STOPPED || 'generation_stopped';
-    const onGenerationStopped = () => { lastStreamText = ''; };
+    const onGenerationStopped = () => { streamClosed = true; cancelStreamTimer(); lastStreamText = ''; };
     eventSource.on(genStopEvent, onGenerationStopped);
     cleanups.push(() => eventSource.removeListener?.(genStopEvent, onGenerationStopped));
     eventSource.on(event_types.CHAT_CHANGED, onChat);`,

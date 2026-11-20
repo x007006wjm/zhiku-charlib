@@ -129,7 +129,10 @@ export function createMarkerController({context,getData,generate,upload,notify,e
     // 等消息真正落地时，process() 发现这条记录已在手上，就直接复用，不再等。
     // 按「聊天|楼层|标记」存，不按消息对象：宿主落地时可能换掉那个对象，按对象存会对不上、白生成一次。
     const pregen=new Map();          // "chat|floor|swipe:index:raw" -> {state,job,token,image,prompt,error}
+    // 本轮生成已派发过的去重集合（takePregen 取走后不删，只在 pregenReset / stop 时清空，防止尾随流式事件重复生图）
+    const pregenSeen=new Set();
     function pregenSlot(chat,floor,msg,token){return chat+'|'+floor+'|'+recordKey(msg,token);}
+    function pregenSeenKey(chat,token){return chat+'|'+String(token?.prompt||'');}
     /** 剥离推理模型的 <think>/<thinking>/<thought> 思考过程，避免误预生成思考草稿里的标记。 */
     function stripThinking(text){
         if(!text||typeof text!=='string')return '';
@@ -143,7 +146,7 @@ export function createMarkerController({context,getData,generate,upload,notify,e
     /** 流式文本里已经闭合的标记（未闭合的不管：那时提示词还没写完） */
     function closedMarkers(text,cfg){return parseImageMarkers(stripThinking(text),cfg.start,cfg.end);}
     function streamBuffer(){return typeof getStreamingText==='function'?String(getStreamingText()||''):'';}
-    function pregenReset(){pregen.clear();}
+    function pregenReset(){pregen.clear();pregenSeen.clear();}
     /** 没人来取（生成被打断、消息没落地）的结果不会一直堆着：超过 8 条就丢最早的「已经跑完的」那些，在跑的留着 */
     function pregenPrune(){
         if(pregen.size<=8)return;
@@ -174,8 +177,8 @@ export function createMarkerController({context,getData,generate,upload,notify,e
         const chatId=chatKey(c);
         let fired=0;
         for(const token of tokens){
-            const key=recordKey(msg,token),slot=pregenSlot(chatId,floor,msg,token);
-            if(pregen.has(slot))continue;
+            const key=recordKey(msg,token),slot=pregenSlot(chatId,floor,msg,token),seenKey=pregenSeenKey(chatId,token);
+            if(pregen.has(slot)||pregenSeen.has(seenKey))continue;
             // 同聊天同楼层已按相同提示词发起过预生成也跳过（避免思考块长度变化导致 index 偏移重复请求）
             let dup=false;
             for(const existing of pregen.values()){
@@ -184,6 +187,7 @@ export function createMarkerController({context,getData,generate,upload,notify,e
             if(dup)continue;
             if(msg.extra?.zhikuImages?.[key])continue;
             if(failed.get(msg)?.has(key))continue;
+            pregenSeen.add(seenKey);
             const entry={state:'预生成中…',job:null,token,raw:token.raw,key,floor,chat:chatId};
             pregen.set(slot,entry);
             entry.job=queue.then(async()=>{

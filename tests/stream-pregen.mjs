@@ -215,6 +215,11 @@ function setup({stream = true, reason = 'stream'} = {}) {
     assert.equal(saved, 1);
     assert.equal(prompts.length, 1, '落地时按提示词复用，不重复请求');
     assert(notices.some(n => n.level === 'success' && n.msg.includes('已插入流式预生成图片')), '插入完成应有 success 提醒');
+    // 落地之后如果还有尾随的流式回调再次调用 pregenSweep，绝不能重复发送生图请求
+    const trailingFired = await controller.pregenSweep('<think>草稿</think>正文开始 image###real_scene### 后续完成');
+    await controller.idle();
+    assert.equal(trailingFired, 0, '落地后的尾随流式事件不能重复触发预生成');
+    assert.equal(prompts.length, 1, '尾随流式事件不能导致重复生图');
     controller.stop();
 }
 
