@@ -70,7 +70,7 @@ function deleteUcpPreset(presets, id) {
     return normalizeUcpPresets(presets).filter(p => p.id !== target);
 }
 
-// 智库 · 原生扩展版 v0.8.10（二改自从前佬的智绘姬）
+// 智库 · 原生扩展版 v0.8.11（二改自从前佬的智绘姬）
 // 不需要智绘姬，填 NovelAI key 就能用。
 // NovelAI 请求格式参考了智绘姬（作者：从前跟你一样，https://github.com/damoshen123/st-chatu8，AFPL v9）。
 const P = (() => { try { if (window.parent && window.parent !== window && window.parent.document) return window.parent; } catch (e) { /* 跨域 */ } return window; })();
@@ -88,7 +88,7 @@ const __shim = {
     get extension_settings() { return __ctx().extensionSettings; },
 };
 
-globalThis.__PC_VERSION = '0.8.10';
+globalThis.__PC_VERSION = '0.8.11';
 
 // ───── model.js ─────
 const __mod_model = (() => {
@@ -4198,7 +4198,7 @@ const __mod_marker=createMarkerController({
             __mod_engine.afterChatImage();
             return image;
         },
-        upload:__mod_store.uploadImage,notify:(message,level)=>toastr[level]?.(message,'智库 · 标记生图')
+        upload:__mod_store.uploadImage,notify:(message,level)=>{const t=P.toastr||window.toastr||globalThis.toastr;const lv=level||'info';console.info('[智库 · 标记生图]',lv,message);if(t&&typeof t[lv]==='function'){t[lv](message,'智库 · 标记生图',{timeOut:lv==='error'?6000:3500});}else{const el=DOC.createElement('div');el.textContent='智库 · '+message;el.style.cssText='position:fixed;top:16px;right:16px;z-index:45000;padding:10px 14px;border-radius:8px;background:rgba(20,24,34,.92);color:#fff;font-size:13px;box-shadow:0 4px 16px rgba(0,0,0,.35);pointer-events:none';pcMount(el);setTimeout(()=>el.remove(),3500);}}
     });
 const __mod_ui = (() => {
 /**
@@ -7849,8 +7849,9 @@ async function start() {
     addMesButtons();
     const streamEvent = event_types.STREAM_TOKEN_RECEIVED || 'stream_token_received';
     let streamTimer = null, streamBusy = false, lastStreamText = '';
-    const onStreamToken = (text) => {
-        if (typeof text === 'string' && text) lastStreamText = text;
+    const onStreamToken = (payload) => {
+        const text = typeof payload === 'string' ? payload : (typeof payload?.text === 'string' ? payload.text : (typeof payload?.content === 'string' ? payload.content : ''));
+        if (text) lastStreamText = text;
         if (streamTimer !== null) return;
         streamTimer = setTimeout(() => {
             streamTimer = null;

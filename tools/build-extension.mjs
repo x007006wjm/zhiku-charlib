@@ -6,7 +6,7 @@ import {applyCharLibrary} from './apply-char-lib.mjs';
 import {fileURLToPath} from 'node:url';
 process.chdir(fileURLToPath(new URL('../', import.meta.url)));
 const dir='.';
-const VERSION='0.8.10';
+const VERSION='0.8.11';
 let s=applyMarkers(JSON.parse(fs.readFileSync('zhiku.script.json','utf8')).content);
 function patch(a,b){assert.equal(s.split(a).length,2,a.slice(0,80));s=s.replace(a,()=>b);}
 patch("globalThis.__PC_VERSION = '0.6.3';", `globalThis.__PC_VERSION = '${VERSION}';`);
@@ -266,6 +266,8 @@ s=applyCharLibrary(s);
 // 1) 去重启动时双倍 refresh()；2) 增量单楼层 decorate + 批量防抖 addMesButtons，消除 O(N^2) DOM 风暴；
 // 3) 串行化 applyCharacterBlocks -> process，避免并发 saveChat() 竞态；4) 切聊天防抖并立即清理流式预生成缓存。
 {
+    patch("upload:__mod_store.uploadImage,notify:(message,level)=>toastr[level]?.(message,'智库 · 标记生图')",
+        "upload:__mod_store.uploadImage,notify:(message,level)=>{const t=P.toastr||window.toastr||globalThis.toastr;const lv=level||'info';console.info('[智库 · 标记生图]',lv,message);if(t&&typeof t[lv]==='function'){t[lv](message,'智库 · 标记生图',{timeOut:lv==='error'?6000:3500});}else{const el=DOC.createElement('div');el.textContent='智库 · '+message;el.style.cssText='position:fixed;top:16px;right:16px;z-index:45000;padding:10px 14px;border-radius:8px;background:rgba(20,24,34,.92);color:#fff;font-size:13px;box-shadow:0 4px 16px rgba(0,0,0,.35);pointer-events:none';pcMount(el);setTimeout(()=>el.remove(),3500);}}");
     patch('    setTimeout(() => __mod_marker.refresh(), 0);\n    setTimeout(() => __mod_marker.refresh(), 0);',
         '    setTimeout(() => __mod_marker.refresh(), 0);');
     patch(`function addMesButtons() {
@@ -379,7 +381,8 @@ function setTimeout(fn, delay, ...args) {
 function clearTimeout(id) { window.clearTimeout(id); timers.delete(id); }
 `;
 fs.writeFileSync(dir+'/runtime.js',prefix+s+'\n}\n');
-fs.copyFileSync('src/index.js',dir+'/index.js');
+const indexSrc = fs.readFileSync('src/index.js', 'utf8').replace("import('./runtime.js')", `import('./runtime.js?v=${VERSION}')`);
+fs.writeFileSync(dir+'/index.js', indexSrc);
 fs.writeFileSync(dir+'/manifest.json',JSON.stringify({display_name:'智库',loading_order:100,js:'index.js',author:'if love',version:VERSION,homePage:'https://github.com/x007006wjm/zhiku-charlib',auto_update:true,minimum_client_version:'1.14.0',dependencies:[],hooks:{enable:'onEnable',disable:'onDisable',delete:'onDelete'}},null,2)+'\n');
 fs.writeFileSync(dir+'/package.json',JSON.stringify({name:'zhiku-tavern-helper',version:VERSION,private:true,type:'module'},null,2)+'\n');
 fs.writeFileSync(dir+'/capability-contract.json',JSON.stringify({schemaVersion:1,minimum:{sillytavern:'1.14.0',tavernHelper:null},requirements:[{id:'host-context',owner:'sillytavern',symbol:'SillyTavern.getContext',required:true,fallback:null}]},null,2));

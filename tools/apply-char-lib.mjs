@@ -561,8 +561,9 @@ async function charAction(act, el) {`,
     patch('    eventSource.on(event_types.CHAT_CHANGED, onChat);',
         `    const streamEvent = event_types.STREAM_TOKEN_RECEIVED || 'stream_token_received';
     let streamTimer = null, streamBusy = false, lastStreamText = '';
-    const onStreamToken = (text) => {
-        if (typeof text === 'string' && text) lastStreamText = text;
+    const onStreamToken = (payload) => {
+        const text = typeof payload === 'string' ? payload : (typeof payload?.text === 'string' ? payload.text : (typeof payload?.content === 'string' ? payload.content : ''));
+        if (text) lastStreamText = text;
         if (streamTimer !== null) return;
         streamTimer = setTimeout(() => {
             streamTimer = null;
