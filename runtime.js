@@ -70,7 +70,7 @@ function deleteUcpPreset(presets, id) {
     return normalizeUcpPresets(presets).filter(p => p.id !== target);
 }
 
-// 智库 · 原生扩展版 v0.8.9（二改自从前佬的智绘姬）
+// 智库 · 原生扩展版 v0.8.10（二改自从前佬的智绘姬）
 // 不需要智绘姬，填 NovelAI key 就能用。
 // NovelAI 请求格式参考了智绘姬（作者：从前跟你一样，https://github.com/damoshen123/st-chatu8，AFPL v9）。
 const P = (() => { try { if (window.parent && window.parent !== window && window.parent.document) return window.parent; } catch (e) { /* 跨域 */ } return window; })();
@@ -88,7 +88,7 @@ const __shim = {
     get extension_settings() { return __ctx().extensionSettings; },
 };
 
-globalThis.__PC_VERSION = '0.8.9';
+globalThis.__PC_VERSION = '0.8.10';
 
 // ───── model.js ─────
 const __mod_model = (() => {
@@ -3780,8 +3780,8 @@ function createMarkerController({context,getData,generate,upload,notify,expandPr
     }
     /**
      * 取出流式阶段的成果并删掉它（只能取一次）。
-     * 先按「聊天|楼层|记录键」精确找；流式文本与落地文本偶尔会有细微出入（多一个空格、
-     * 标记位置挪了），这时退一步按标记原文找同一楼的那条，别让已经生成好的图白扔。
+     * 先按「聊天|楼层|记录键」精确找；流式文本与落地文本偶尔会有细微出入（剥离思考块、多一个空格、
+     * 标记位置或楼层下标挪了），这时退一步按标记原文 / 提示词内容匹配，别让已经生成好的图白扔。
      */
     function takePregen(id,msg,token){
         if(!pregen.size)return null;
@@ -3789,7 +3789,12 @@ function createMarkerController({context,getData,generate,upload,notify,expandPr
         let hitKey=pregen.has(slot)?slot:null;
         if(!hitKey){
             for(const [k,entry] of pregen){
-                if(entry.floor===floor&&entry.chat===chatId&&entry.raw===token.raw){hitKey=k;break;}
+                if(entry.chat===chatId&&entry.floor===floor&&(entry.raw===token.raw||entry.token?.prompt===token.prompt)){hitKey=k;break;}
+            }
+        }
+        if(!hitKey){
+            for(const [k,entry] of pregen){
+                if(entry.chat===chatId&&Math.abs(entry.floor-floor)<=1&&(entry.raw===token.raw||entry.token?.prompt===token.prompt)){hitKey=k;break;}
             }
         }
         if(!hitKey)return null;
@@ -3851,8 +3856,18 @@ function createMarkerController({context,getData,generate,upload,notify,expandPr
     // 按「聊天|楼层|标记」存，不按消息对象：宿主落地时可能换掉那个对象，按对象存会对不上、白生成一次。
     const pregen=new Map();          // "chat|floor|swipe:index:raw" -> {state,job,token,image,prompt,error}
     function pregenSlot(chat,floor,msg,token){return chat+'|'+floor+'|'+recordKey(msg,token);}
+    /** 剥离推理模型的 <think>/<thinking>/<thought> 思考过程，避免误预生成思考草稿里的标记。 */
+    function stripThinking(text){
+        if(!text||typeof text!=='string')return '';
+        let cleaned=text.replace(/<\s*(?:think(?:ing)?|thought)(?:\s+[^>]*)?>[\s\S]*?<\/\s*(?:think(?:ing)?|thought)\s*>/gi,'');
+        const closeMatch=cleaned.match(/<\/\s*(?:think(?:ing)?|thought)\s*>/i);
+        if(closeMatch&&closeMatch.index!==undefined)cleaned=cleaned.slice(closeMatch.index+closeMatch[0].length);
+        const openMatch=cleaned.match(/<\s*(?:think(?:ing)?|thought)(?:\s+[^>]*)?>/i);
+        if(openMatch&&openMatch.index!==undefined)cleaned=cleaned.slice(0,openMatch.index);
+        return cleaned;
+    }
     /** 流式文本里已经闭合的标记（未闭合的不管：那时提示词还没写完） */
-    function closedMarkers(text,cfg){return parseImageMarkers(text,cfg.start,cfg.end);}
+    function closedMarkers(text,cfg){return parseImageMarkers(stripThinking(text),cfg.start,cfg.end);}
     function streamBuffer(){return typeof getStreamingText==='function'?String(getStreamingText()||''):'';}
     function pregenReset(){pregen.clear();}
     /** 没人来取（生成被打断、消息没落地）的结果不会一直堆着：超过 8 条就丢最早的「已经跑完的」那些，在跑的留着 */
@@ -3863,11 +3878,12 @@ function createMarkerController({context,getData,generate,upload,notify,expandPr
             if(!entry.job)pregen.delete(slot);
         }
     }
-    async function pregenSweep(){
+    async function pregenSweep(streamText){
         if(stopped)return 0;
         const cfg=settings();
         if(!cfg.auto||!cfg.stream)return 0;
-        const text=streamBuffer();
+        const hasExplicit=typeof streamText==='string'&&streamText.length>0;
+        const text=hasExplicit?streamText:streamBuffer();
         if(!text.includes(cfg.start))return 0;
         const c=context(),chat=c.chat||[];
         // 流式阶段这条助手消息有时还没进 chat：它会落在 chat.length 这个位置，先按占位对象算好键，
@@ -3875,7 +3891,7 @@ function createMarkerController({context,getData,generate,upload,notify,expandPr
         let floor=chat.length-1,msg=chat[floor];
         if(msg&&msg.is_system)return 0;
         if(!msg||msg.is_user){
-            const generating=c.is_send_press||c.generating||c.streamingProcessor?.isStreaming;
+            const generating=hasExplicit||c.is_send_press||c.generating||c.streamingProcessor?.isStreaming;
             if(!generating)return 0;
             floor=chat.length;msg={swipe_id:0,mes:''};
         }
@@ -3886,6 +3902,12 @@ function createMarkerController({context,getData,generate,upload,notify,expandPr
         for(const token of tokens){
             const key=recordKey(msg,token),slot=pregenSlot(chatId,floor,msg,token);
             if(pregen.has(slot))continue;
+            // 同聊天同楼层已按相同提示词发起过预生成也跳过（避免思考块长度变化导致 index 偏移重复请求）
+            let dup=false;
+            for(const existing of pregen.values()){
+                if(existing.chat===chatId&&Math.abs(existing.floor-floor)<=1&&(existing.raw===token.raw||existing.token?.prompt===token.prompt)){dup=true;break;}
+            }
+            if(dup)continue;
             if(msg.extra?.zhikuImages?.[key])continue;
             if(failed.get(msg)?.has(key))continue;
             const entry={state:'预生成中…',job:null,token,raw:token.raw,key,floor,chat:chatId};
@@ -3893,15 +3915,20 @@ function createMarkerController({context,getData,generate,upload,notify,expandPr
             entry.job=queue.then(async()=>{
                 if(stopped)return 0;
                 entry.state='生成中…';
+                notify('流式预生成：已发送生图请求…','info');
                 const meta={msgId:floor,key,swipe:msg.swipe_id,pos:token.index};
                 const resolved=typeof expandPrompt==='function'?expandPrompt(token.prompt,meta):token.prompt;
                 const prompt=resolved&&typeof resolved==='object'&&resolved.text!==undefined?String(resolved.text):String(resolved??token.prompt);
                 const recordPrompt=resolved&&typeof resolved==='object'&&resolved.record!==undefined?String(resolved.record):prompt;
                 entry.prompt=recordPrompt;
                 entry.image=await generate(prompt,meta);
+                if(!stopped)notify('流式预生成：图片已生成，等待消息落地插入','success');
                 return 1;
-            }).catch(error=>{entry.error=error?.message||String(error);return 0;})
-              .finally(()=>{entry.job=null;});
+            }).catch(error=>{
+                entry.error=error?.message||String(error);
+                if(!stopped)notify('流式预生成失败：'+entry.error,'error');
+                return 0;
+            }).finally(()=>{entry.job=null;});
             queue=entry.job.catch(()=>{});
             pregenPrune();
             fired++;
@@ -3926,12 +3953,113 @@ function createMarkerController({context,getData,generate,upload,notify,expandPr
         try{await context().saveChat();}catch(e){records[key]=old;throw e;}
         decorate(id);
     }
+    function openImageViewer(src, actions = []) {
+        const back=doc.createElement('div'),stage=doc.createElement('div'),img=doc.createElement('img'),bar=doc.createElement('div');
+        back.className='pc-image-preview pc-lightbox';
+        stage.className='pc-lightbox-stage';
+        img.src=src;img.className='pc-lightbox-img';img.alt='预览图片';img.draggable=false;
+        bar.className='pc-lightbox-bar';
+        let scale=1,tx=0,ty=0,dragging=false,dragStart=null,lastTap=0;
+        const pointers=new Map();let pinchStart=null;
+        const zoomLabel=doc.createElement('button');zoomLabel.type='button';zoomLabel.className='pc-lb-btn';zoomLabel.title='点击重置缩放';
+        const sync=()=>{
+            if(scale<=1.01){scale=1;tx=0;ty=0;}
+            img.style.transform=`translate3d(${tx}px,${ty}px,0) scale(${scale})`;
+            stage.style.cursor=scale>1?(dragging?'grabbing':'grab'):'zoom-in';
+            zoomLabel.textContent=Math.round(scale*100)+'%';
+        };
+        const setScale=(next,cx,cy)=>{
+            const clamped=Math.min(5,Math.max(1,Math.round(next*100)/100));
+            if(clamped===1){scale=1;tx=0;ty=0;sync();return;}
+            if(cx!=null&&cy!=null&&typeof stage.getBoundingClientRect==='function'){
+                const rect=stage.getBoundingClientRect();
+                const ox=cx-(rect.left+rect.width/2),oy=cy-(rect.top+rect.height/2);
+                const ratio=clamped/scale;
+                tx=ox-(ox-tx)*ratio;ty=oy-(oy-ty)*ratio;
+            }
+            scale=clamped;sync();
+        };
+        const mkBtn=(text,fn,cls='')=>{const b=doc.createElement('button');b.type='button';b.className='pc-lb-btn'+(cls?' '+cls:'');b.textContent=text;b.onclick=fn;return b;};
+        const dismiss=()=>{
+            if(typeof doc.removeEventListener==='function')doc.removeEventListener('keydown',onKey);
+            back.remove();overlays.delete(back);
+        };
+        const onKey=e=>{
+            if(e.key==='Escape')dismiss();
+            else if(e.key==='+'||e.key==='=')setScale(scale*1.25);
+            else if(e.key==='-')setScale(scale/1.25);
+            else if(e.key==='0')setScale(1);
+        };
+        if(typeof doc.addEventListener==='function')doc.addEventListener('keydown',onKey);
+        zoomLabel.onclick=()=>setScale(1);
+        const zoomOut=mkBtn('－',()=>setScale(scale/1.3));
+        const zoomIn=mkBtn('＋',()=>setScale(scale*1.3));
+        const download=doc.createElement('a');download.href=src;download.download='image.png';download.textContent='下载';download.className='pc-lb-btn';
+        const close=mkBtn('关闭',dismiss,'pc-lb-close');
+        bar.append(zoomOut,zoomLabel,zoomIn,download);
+        for(const act of actions){
+            bar.append(mkBtn(act.label,()=>act.onClick(dismiss),act.cls||''));
+        }
+        bar.append(close);
+        stage.append(img);
+        back.append(stage,bar);
+        doc.body.append(back);
+        overlays.add(back);
+        sync();
+        // 滚轮缩放
+        stage.addEventListener('wheel',e=>{e.preventDefault();setScale(scale*(e.deltaY<0?1.2:1/1.2),e.clientX,e.clientY);},{passive:false});
+        // 双击放大 / 还原
+        stage.addEventListener('dblclick',e=>{e.preventDefault();setScale(scale>1.2?1:2.2,e.clientX,e.clientY);});
+        // 点击空白处关闭
+        stage.addEventListener('click',e=>{if(e.target===stage&&scale<=1)dismiss();});
+        // 指针拖拽平移 & 双指捏合缩放
+        stage.addEventListener('pointerdown',e=>{
+            if(e.button!=null&&e.button!==0)return;
+            pointers.set(e.pointerId,{x:e.clientX,y:e.clientY});
+            if(pointers.size===2){
+                const pts=[...pointers.values()];
+                pinchStart={dist:Math.hypot(pts[0].x-pts[1].x,pts[0].y-pts[1].y),scale,cx:(pts[0].x+pts[1].x)/2,cy:(pts[0].y+pts[1].y)/2};
+                dragging=false;
+                return;
+            }
+            // 移动端双击检测
+            const now=Date.now();
+            if(e.pointerType==='touch'&&now-lastTap<300){lastTap=0;setScale(scale>1.2?1:2.2,e.clientX,e.clientY);return;}
+            lastTap=now;
+            if(scale>1){
+                dragging=true;
+                dragStart={x:e.clientX-tx,y:e.clientY-ty};
+                stage.setPointerCapture?.(e.pointerId);
+                sync();
+            }
+        });
+        stage.addEventListener('pointermove',e=>{
+            if(!pointers.has(e.pointerId))return;
+            pointers.set(e.pointerId,{x:e.clientX,y:e.clientY});
+            if(pointers.size===2&&pinchStart){
+                const pts=[...pointers.values()];
+                const dist=Math.hypot(pts[0].x-pts[1].x,pts[0].y-pts[1].y);
+                if(pinchStart.dist>0)setScale(pinchStart.scale*(dist/pinchStart.dist),pinchStart.cx,pinchStart.cy);
+                return;
+            }
+            if(dragging&&dragStart&&scale>1){
+                tx=e.clientX-dragStart.x;ty=e.clientY-dragStart.y;
+                sync();
+            }
+        });
+        const endPtr=e=>{
+            pointers.delete(e.pointerId);
+            if(pointers.size<2)pinchStart=null;
+            if(dragging){dragging=false;dragStart=null;sync();}
+        };
+        for(const ev of ['pointerup','pointercancel'])stage.addEventListener(ev,endPtr);
+        return {dismiss};
+    }
     function preview(id,msg,token,index,record){
-        const {box,dismiss}=dialog(),img=doc.createElement('img'),download=doc.createElement('a'),edit=doc.createElement('button'),remove=doc.createElement('button');
-        img.src=record.url;download.href=record.url;download.download='image.png';download.textContent='下载';edit.type=remove.type='button';edit.textContent='编辑 / 重新生成';remove.textContent='删除当前图片';
-        edit.onclick=()=>{dismiss();editPrompt(id,msg,token,index);};
-        remove.onclick=async()=>{try{await deleteResult(id,msg,token);dismiss();}catch(e){notify(e.message,'error');}};
-        box.append(img,download,edit,remove);
+        openImageViewer(record.url,[
+            {label:'编辑 / 重新生成',onClick:dismiss=>{dismiss();editPrompt(id,msg,token,index);}},
+            {label:'删除图片',cls:'pc-lb-danger',onClick:async dismiss=>{try{await deleteResult(id,msg,token);dismiss();}catch(e){notify(e.message,'error');}}},
+        ]);
     }
     function editPrompt(id,msg,token,index){
         const source=msg.mes,swipe=msg.swipe_id,{box,dismiss}=dialog(),input=doc.createElement('textarea'),send=doc.createElement('button'),remove=doc.createElement('button');
@@ -3957,14 +4085,7 @@ function createMarkerController({context,getData,generate,upload,notify,expandPr
             const bar=doc.createElement('div');bar.className='pc-image-actions';
             const view=doc.createElement('button'),remove=doc.createElement('button');
             view.type=remove.type='button';view.textContent='查看';remove.textContent='删除图片';
-            const open=()=>{
-                const overlay=doc.createElement('div');overlay.className='pc-image-preview';
-                const picture=doc.createElement('img'),close=doc.createElement('button');
-                picture.src=img.src;close.type='button';close.textContent='关闭';
-                overlay.append(picture,close);doc.body.append(overlay);overlays.add(overlay);
-                const dismiss=()=>{overlay.remove();overlays.delete(overlay);};
-                close.onclick=dismiss;overlay.onclick=e=>{if(e.target===overlay)dismiss();};
-            };
+            const open=()=>openImageViewer(img.src);
             view.onclick=open;img.addEventListener('click',e=>{e.preventDefault();e.stopPropagation();open();});
             remove.onclick=async()=>{
                 if(pending.has(msg)){notify('请等本楼生成结束后再删除图片','info');return;}
@@ -4028,6 +4149,7 @@ function createMarkerController({context,getData,generate,upload,notify,expandPr
                     // 流式阶段已经出好的图直接用；没有（还在跑就等它跑完，失败了或用户改过提示词就重来）才请求。
                     if(ready?.job)await ready.job.catch(()=>{});
                     const reuse=ready?.image!==undefined&&!promptOverride;
+                    if(!reuse)notify('已发送生图请求，正在生成…','info');
                     const image=reuse?ready.image:await generate(prompt,markerMeta);
                     if(!current())return 0;
                     entry.state='保存中…';decorate(id);
@@ -4035,7 +4157,9 @@ function createMarkerController({context,getData,generate,upload,notify,expandPr
                     if(!url)throw new Error('图片上传未返回地址');
                     const hadExtra=!!msg.extra;msg.extra ||= {};const hadRecords=!!msg.extra.zhikuImages,records=msg.extra.zhikuImages ||= {},old=records[key];records[key]={url:String(url),prompt:recordPrompt};
                     try{await c.saveChat();}catch(e){if(old)records[key]=old;else delete records[key];if(!hadRecords&&!Object.keys(records).length)delete msg.extra.zhikuImages;if(!hadExtra&&!Object.keys(msg.extra).length)delete msg.extra;throw e;}
-                    failed.get(msg)?.delete(key);freshResults.add(key);return 1;
+                    failed.get(msg)?.delete(key);freshResults.add(key);
+                    notify(reuse?'已插入流式预生成图片':'图片生成完成','success');
+                    return 1;
                 }catch(e){let errors=failed.get(msg);if(!errors){errors=new Set();failed.set(msg,errors);}errors.add(key);notify(e.message||String(e),'error');return 0;}
             }).finally(()=>{map.delete(key);if(!map.size)pending.delete(msg);if(current())decorate(id);});
             entry.job=job;queue=job.catch(()=>{});return job;
@@ -7723,34 +7847,29 @@ async function start() {
         cleanups.push(() => eventSource.removeListener?.(ev, fn));
     }
     addMesButtons();
-    if (event_types.STREAM_TOKEN_RECEIVED) {
-        let streamTimer = null, streamBusy = false;
-        const onStreamToken = () => {
-            if (streamTimer !== null) return;
-            streamTimer = setTimeout(() => {
-                streamTimer = null;
-                if (streamBusy) return;
-                streamBusy = true;
-                Promise.resolve(__mod_marker.pregenSweep?.()).catch(e => console.warn('[智库] 流式预生成', e)).finally(() => { streamBusy = false; });
-            }, 250);
-        };
-        eventSource.on(event_types.STREAM_TOKEN_RECEIVED, onStreamToken);
-        cleanups.push(() => { if (streamTimer !== null) clearTimeout(streamTimer); eventSource.removeListener?.(event_types.STREAM_TOKEN_RECEIVED, onStreamToken); });
-    } else {
-        // 宿主没有流式事件（旧版 / 换了实现）：退化成轮询，一样的 250ms 节流
-        const poll = setInterval(() => {
-            try {
-                const c = SillyTavern.getContext();
-                if (c.is_send_press || c.generating || c.streamingProcessor?.isStreaming) void __mod_marker.pregenSweep?.();
-            } catch (e) { /* 宿主没这个字段就算了 */ }
-        }, 400);
-        cleanups.push(() => clearInterval(poll));
-    }
-    if (event_types.GENERATION_STARTED) {
-        const onGenerationStarted = () => __mod_marker.pregenReset?.();
-        eventSource.on(event_types.GENERATION_STARTED, onGenerationStarted);
-        cleanups.push(() => eventSource.removeListener?.(event_types.GENERATION_STARTED, onGenerationStarted));
-    }
+    const streamEvent = event_types.STREAM_TOKEN_RECEIVED || 'stream_token_received';
+    let streamTimer = null, streamBusy = false, lastStreamText = '';
+    const onStreamToken = (text) => {
+        if (typeof text === 'string' && text) lastStreamText = text;
+        if (streamTimer !== null) return;
+        streamTimer = setTimeout(() => {
+            streamTimer = null;
+            if (streamBusy) return;
+            streamBusy = true;
+            const snap = lastStreamText;
+            Promise.resolve(__mod_marker.pregenSweep?.(snap)).catch(e => console.warn('[智库] 流式预生成', e)).finally(() => { streamBusy = false; });
+        }, 180);
+    };
+    eventSource.on(streamEvent, onStreamToken);
+    cleanups.push(() => { if (streamTimer !== null) clearTimeout(streamTimer); eventSource.removeListener?.(streamEvent, onStreamToken); });
+    const genStartEvent = event_types.GENERATION_STARTED || 'generation_started';
+    const onGenerationStarted = () => { lastStreamText = ''; __mod_marker.pregenReset?.(); };
+    eventSource.on(genStartEvent, onGenerationStarted);
+    cleanups.push(() => eventSource.removeListener?.(genStartEvent, onGenerationStarted));
+    const genStopEvent = event_types.GENERATION_STOPPED || 'generation_stopped';
+    const onGenerationStopped = () => { lastStreamText = ''; };
+    eventSource.on(genStopEvent, onGenerationStopped);
+    cleanups.push(() => eventSource.removeListener?.(genStopEvent, onGenerationStopped));
     eventSource.on(event_types.CHAT_CHANGED, onChat);
     cleanups.push(() => eventSource.removeListener?.(event_types.CHAT_CHANGED, onChat));
     E.applyBindingOnChatChange();

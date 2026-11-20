@@ -559,34 +559,29 @@ async function charAction(act, el) {`,
     // ⑫ 流式预生成：文字还在流的时候就看有没有已经闭合的标记，有就先发生图请求；
     //    新一次生成开始时把上一次没落地的预生成结果丢掉（换 swipe / 重新生成时不能串图）。
     patch('    eventSource.on(event_types.CHAT_CHANGED, onChat);',
-        `    if (event_types.STREAM_TOKEN_RECEIVED) {
-        let streamTimer = null, streamBusy = false;
-        const onStreamToken = () => {
-            if (streamTimer !== null) return;
-            streamTimer = setTimeout(() => {
-                streamTimer = null;
-                if (streamBusy) return;
-                streamBusy = true;
-                Promise.resolve(__mod_marker.pregenSweep?.()).catch(e => console.warn('[智库] 流式预生成', e)).finally(() => { streamBusy = false; });
-            }, 250);
-        };
-        eventSource.on(event_types.STREAM_TOKEN_RECEIVED, onStreamToken);
-        cleanups.push(() => { if (streamTimer !== null) clearTimeout(streamTimer); eventSource.removeListener?.(event_types.STREAM_TOKEN_RECEIVED, onStreamToken); });
-    } else {
-        // 宿主没有流式事件（旧版 / 换了实现）：退化成轮询，一样的 250ms 节流
-        const poll = setInterval(() => {
-            try {
-                const c = SillyTavern.getContext();
-                if (c.is_send_press || c.generating || c.streamingProcessor?.isStreaming) void __mod_marker.pregenSweep?.();
-            } catch (e) { /* 宿主没这个字段就算了 */ }
-        }, 400);
-        cleanups.push(() => clearInterval(poll));
-    }
-    if (event_types.GENERATION_STARTED) {
-        const onGenerationStarted = () => __mod_marker.pregenReset?.();
-        eventSource.on(event_types.GENERATION_STARTED, onGenerationStarted);
-        cleanups.push(() => eventSource.removeListener?.(event_types.GENERATION_STARTED, onGenerationStarted));
-    }
+        `    const streamEvent = event_types.STREAM_TOKEN_RECEIVED || 'stream_token_received';
+    let streamTimer = null, streamBusy = false, lastStreamText = '';
+    const onStreamToken = (text) => {
+        if (typeof text === 'string' && text) lastStreamText = text;
+        if (streamTimer !== null) return;
+        streamTimer = setTimeout(() => {
+            streamTimer = null;
+            if (streamBusy) return;
+            streamBusy = true;
+            const snap = lastStreamText;
+            Promise.resolve(__mod_marker.pregenSweep?.(snap)).catch(e => console.warn('[智库] 流式预生成', e)).finally(() => { streamBusy = false; });
+        }, 180);
+    };
+    eventSource.on(streamEvent, onStreamToken);
+    cleanups.push(() => { if (streamTimer !== null) clearTimeout(streamTimer); eventSource.removeListener?.(streamEvent, onStreamToken); });
+    const genStartEvent = event_types.GENERATION_STARTED || 'generation_started';
+    const onGenerationStarted = () => { lastStreamText = ''; __mod_marker.pregenReset?.(); };
+    eventSource.on(genStartEvent, onGenerationStarted);
+    cleanups.push(() => eventSource.removeListener?.(genStartEvent, onGenerationStarted));
+    const genStopEvent = event_types.GENERATION_STOPPED || 'generation_stopped';
+    const onGenerationStopped = () => { lastStreamText = ''; };
+    eventSource.on(genStopEvent, onGenerationStopped);
+    cleanups.push(() => eventSource.removeListener?.(genStopEvent, onGenerationStopped));
     eventSource.on(event_types.CHAT_CHANGED, onChat);`,
         'stream pregen events');
 

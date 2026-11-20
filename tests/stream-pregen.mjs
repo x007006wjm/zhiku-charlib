@@ -186,4 +186,36 @@ function setup({stream = true, reason = 'stream'} = {}) {
     controller.stop();
 }
 
-console.log('PASS: 流式预生成（未闭合不请求、闭合即请求、落地复用、开关关闭、重置、标记变化不复用、消息未入 chat）。');
+// 8) 直接传入 STREAM_TOKEN_RECEIVED 的文本（不依赖 DOM / is_send_press），剥离 <think> 思考块，并触发状态提醒
+{
+    const doc = makeDoc();
+    const data = {options: {}};
+    const userMsg = {mes: 'hello', is_user: true, swipe_id: 0, swipes: ['hello']};
+    const chat = {chat: [userMsg], chatId: 'one', extensionSettings: {},
+        saveSettingsDebounced() {}, async saveChat() {}, updateMessageBlock() {}};
+    const prompts = [], notices = [];
+    const controller = createMarkerController({
+        context: () => chat, getData: () => data,
+        generate: async p => { prompts.push(p); return 'data:image/png;base64,ok'; },
+        upload: async () => ({url: '/user/images/stream.png'}),
+        notify: (msg, level) => notices.push({msg, level}),
+        document: doc,
+    });
+    // 思考块里的草稿标记不能触发预生成；思考块之后的正文标记立刻触发
+    await controller.pregenSweep('<think>草稿 image###draft_only###</think>正文开始 image###real_scene### 后续...');
+    await controller.idle();
+    assert.deepEqual(prompts, ['real_scene'], '应剥离思考块并直接用流式文本触发预生成');
+    assert(notices.some(n => n.level === 'info' && n.msg.includes('生图请求')), '发送预生成请求应有 info 提醒');
+    assert(notices.some(n => n.level === 'success' && n.msg.includes('预生成')), '预生成完成应有 success 提醒');
+    // 落地时文本不带 <think>（index 与流式不同），依然能命中复用
+    const aiMsg = {mes: '正文开始 image###real_scene### 后续完成', swipe_id: 0, swipes: []};
+    aiMsg.swipes = [aiMsg.mes];
+    chat.chat.push(aiMsg);
+    const saved = await controller.process(1);
+    assert.equal(saved, 1);
+    assert.equal(prompts.length, 1, '落地时按提示词复用，不重复请求');
+    assert(notices.some(n => n.level === 'success' && n.msg.includes('已插入流式预生成图片')), '插入完成应有 success 提醒');
+    controller.stop();
+}
+
+console.log('PASS: 流式预生成（未闭合不请求、闭合即请求、落地复用、开关关闭、重置、标记变化不复用、消息未入 chat、直传流式文本/思考块剥离/状态提醒）。');
