@@ -261,6 +261,111 @@ s=applyUxFixes(s);
 }
 // 角色外观库：$名字$ 展开、别名、世界书宏 {{zhiku_characters}}、开关与界面提示
 s=applyCharLibrary(s);
+// TauriTavern / WebView 流畅度与事件逻辑优化：
+// 1) 去重启动时双倍 refresh()；2) 增量单楼层 decorate + 批量防抖 addMesButtons，消除 O(N^2) DOM 风暴；
+// 3) 串行化 applyCharacterBlocks -> process，避免并发 saveChat() 竞态；4) 切聊天防抖并立即清理流式预生成缓存。
+{
+    patch('    setTimeout(() => __mod_marker.refresh(), 0);\n    setTimeout(() => __mod_marker.refresh(), 0);',
+        '    setTimeout(() => __mod_marker.refresh(), 0);');
+    patch(`function addMesButtons() {
+    __mod_marker.decorateAll();
+    DOC.querySelectorAll('#chat .mes').forEach(mes => {
+        const box = mes.querySelector('.extraMesButtons') || mes.querySelector('.mes_buttons');
+        if (!box || box.querySelector('.pc-mes-gen')) return;
+        const o = DOC.createElement('div');
+        o.className = 'mes_button pc-mes-outfit fa-solid fa-shirt interactable';
+        o.title = '智库：按这一楼的剧情设计服装';
+        o.tabIndex = 0;
+        box.prepend(o);
+        const b = DOC.createElement('div');
+        b.className = 'mes_button pc-mes-gen fa-solid fa-image interactable';
+        b.title = '智库：请在对应提示词旁点击生成';
+        b.tabIndex = 0;
+        box.prepend(b);
+    });
+}`,
+    `function attachMesButton(mes) {
+    if (!mes) return;
+    const box = mes.querySelector('.extraMesButtons') || mes.querySelector('.mes_buttons');
+    if (!box || box.querySelector('.pc-mes-gen')) return;
+    const o = DOC.createElement('div');
+    o.className = 'mes_button pc-mes-outfit fa-solid fa-shirt interactable';
+    o.title = '智库：按这一楼的剧情设计服装';
+    o.tabIndex = 0;
+    box.prepend(o);
+    const b = DOC.createElement('div');
+    b.className = 'mes_button pc-mes-gen fa-solid fa-image interactable';
+    b.title = '智库：请在对应提示词旁点击生成';
+    b.tabIndex = 0;
+    box.prepend(b);
+}
+function addMesButtons(targetId) {
+    if (Number.isInteger(targetId)) {
+        const mes = DOC.querySelector(\`#chat .mes[mesid="\${targetId}"]\`);
+        if (mes) { __mod_marker.decorate(targetId); attachMesButton(mes); }
+        return;
+    }
+    __mod_marker.decorateAll();
+    DOC.querySelectorAll('#chat .mes').forEach(attachMesButton);
+}
+let mesBtnTimer = null, mesBtnFull = false;
+const mesBtnQueue = new Set();
+function scheduleMesButtons(id) {
+    const n = Number(id);
+    if (id !== undefined && Number.isInteger(n) && n >= 0) mesBtnQueue.add(n);
+    else mesBtnFull = true;
+    if (mesBtnQueue.size > 6) mesBtnFull = true;
+    if (mesBtnTimer !== null) return;
+    mesBtnTimer = setTimeout(() => {
+        mesBtnTimer = null;
+        const full = mesBtnFull;
+        const ids = full ? [] : [...mesBtnQueue];
+        mesBtnFull = false;
+        mesBtnQueue.clear();
+        if (full) addMesButtons();
+        else for (const mid of ids) addMesButtons(mid);
+    }, 60);
+}`);
+    patch(`    const onChat = () => setTimeout(() => { __mod_chars.invalidateCharState(); UI.renderChip(); UI.renderStub(); E.applyBindingOnChatChange(); addMesButtons(); }, 300);
+    DOC.addEventListener('click', onChatClick, true);
+    cleanups.push(() => { DOC.removeEventListener('click', onChatClick, true); DOC.querySelectorAll('.pc-mes-gen, .pc-mes-outfit').forEach(n => n.remove()); });
+    const onRendered = id => { setTimeout(addMesButtons, 50); };
+    const onUserRendered = id => { onRendered(id); };
+    const onEdited = id => { onRendered(id); __mod_chars.invalidateCharState(); void __mod_chars.applyCharacterBlocks(Number(id)); };
+    const onSwiped = id => { __mod_chars.invalidateCharState(); void __mod_chars.applyCharacterBlocks(Number(id)); };
+    const onDeleted = () => { __mod_chars.invalidateCharState(); };
+    const onCharMsg = id => {
+        setTimeout(addMesButtons, 50);
+        setTimeout(() => { void __mod_chars.applyCharacterBlocks(Number(id)); }, 0);
+        setTimeout(() => { void __mod_marker.process(Number(id)); }, 0);
+    };`,
+    `    let chatTimer = null;
+    const onChat = () => {
+        __mod_marker.pregenReset?.();
+        if (chatTimer !== null) clearTimeout(chatTimer);
+        chatTimer = setTimeout(() => { chatTimer = null; __mod_chars.invalidateCharState(); UI.renderChip(); UI.renderStub(); E.applyBindingOnChatChange(); scheduleMesButtons(); }, 250);
+    };
+    DOC.addEventListener('click', onChatClick, true);
+    cleanups.push(() => {
+        if (chatTimer !== null) clearTimeout(chatTimer);
+        if (mesBtnTimer !== null) clearTimeout(mesBtnTimer);
+        DOC.removeEventListener('click', onChatClick, true);
+        DOC.querySelectorAll('.pc-mes-gen, .pc-mes-outfit').forEach(n => n.remove());
+    });
+    const onRendered = id => { scheduleMesButtons(id); };
+    const onUserRendered = id => { scheduleMesButtons(id); };
+    const onEdited = id => { scheduleMesButtons(id); __mod_chars.invalidateCharState(); void __mod_chars.applyCharacterBlocks(Number(id)); };
+    const onSwiped = id => { scheduleMesButtons(id); __mod_chars.invalidateCharState(); void __mod_chars.applyCharacterBlocks(Number(id)); };
+    const onDeleted = () => { __mod_chars.invalidateCharState(); };
+    const onCharMsg = id => {
+        const n = Number(id);
+        scheduleMesButtons(n);
+        setTimeout(async () => {
+            try { await __mod_chars.applyCharacterBlocks(n); } catch (e) { console.warn('[智库] 角色块解析', e); }
+            await __mod_marker.process(n);
+        }, 0);
+    };`);
+}
 const prefix=`// Generated from the full script; edit build-extension.mjs and shared-upload.js.
 export function createRuntime() {
 let stopped = false;

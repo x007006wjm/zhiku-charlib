@@ -3803,9 +3803,13 @@ function createMarkerController({context,getData,generate,upload,notify,expandPr
         if(!doc || stopped)return;
         const cfg=settings(),msg=context().chat?.[id];
         if(!msg)return;
-        decorateImages(id,msg);
+        const hasQs=typeof doc.querySelector==='function';
+        const mesNode=hasQs?doc.querySelector(`.mes[mesid="${Number(id)}"] .mes_text`):null;
+        if(hasQs&&!mesNode)return;
+        decorateImages(id,msg,mesNode);
+        const slots=mesNode?mesNode.querySelectorAll(':is(.pc-marker-slot,.custom-pc-marker-slot)'):doc.querySelectorAll(`.mes[mesid="${Number(id)}"] .mes_text :is(.pc-marker-slot,.custom-pc-marker-slot)`);
+        if(!slots.length)return;
         const tokens=parseImageMarkers(msg.mes,cfg.start,cfg.end);
-        const slots=doc.querySelectorAll(`.mes[mesid="${Number(id)}"] .mes_text :is(.pc-marker-slot,.custom-pc-marker-slot)`);
         slots.forEach((slot,index)=>{
             slot.classList.add('pc-marker-slot');
             const token=tokens[index];if(!token)return;
@@ -3825,7 +3829,7 @@ function createMarkerController({context,getData,generate,upload,notify,expandPr
             if(record?.url){
                 const wrapper=doc.createElement('details');wrapper.className='pc-result-collapse';
                 const header=doc.createElement('summary');
-                const img=doc.createElement('img');img.src=record.url;img.className='pc-result-image';img.alt='生成图片';
+                const img=doc.createElement('img');img.src=record.url;img.className='pc-result-image';img.alt='生成图片';img.loading='lazy';img.decoding='async';
                 wrapper.append(header,img);slot.append(wrapper);
                 // 「生成后自动展开」：只对这次刚生成的那张生效，历史图片仍旧收起
                 const fresh=freshResults.delete(recordKey(msg,token)),autoOpen=cfg.expand&&fresh;
@@ -3944,8 +3948,9 @@ function createMarkerController({context,getData,generate,upload,notify,expandPr
         remove.onclick=async()=>{try{await deleteResult(id,msg,token);dismiss();}catch(e){notify(e.message,'error');}};
         box.append(input,send,remove);
     }
-    function decorateImages(id,msg) {
-        for(const img of doc.querySelectorAll(`.mes[mesid="${Number(id)}"] .mes_text img:is(.pc-chat-img,.custom-pc-chat-img)`)) {
+    function decorateImages(id,msg,scope) {
+        const imgs=scope?scope.querySelectorAll('img:is(.pc-chat-img,.custom-pc-chat-img)'):doc.querySelectorAll(`.mes[mesid="${Number(id)}"] .mes_text img:is(.pc-chat-img,.custom-pc-chat-img)`);
+        for(const img of imgs) {
             img.classList.add('pc-chat-img');
             if(imageBindings.has(img))continue;
             imageBindings.add(img);
@@ -4043,7 +4048,7 @@ function createMarkerController({context,getData,generate,upload,notify,expandPr
 }
 
 const __mod_marker=createMarkerController({
-        context:()=>SillyTavern.getContext(),getData:__mod_store.getData,expandPrompt:(prompt,meta)=>__mod_chars.expandMarkerPrompt(prompt,meta),getStreamingText:()=>{const c=SillyTavern.getContext();const live=c.streamingProcessor?.messageText;if(typeof live==="string"&&live)return live;const node=[...DOC.querySelectorAll("#chat .mes[mesid]")].pop();const body=node?.querySelector(".mes_text");if(!body)return "";const clone=body.cloneNode(true);clone.querySelectorAll(".pc-marker-slot,.pc-image-actions").forEach(el=>el.remove());return clone.textContent||"";},document:DOC,
+        context:()=>SillyTavern.getContext(),getData:__mod_store.getData,expandPrompt:(prompt,meta)=>__mod_chars.expandMarkerPrompt(prompt,meta),getStreamingText:()=>{const c=SillyTavern.getContext();const live=c.streamingProcessor?.messageText;if(typeof live==="string"&&live)return live;const chat=DOC.getElementById("chat");let node=chat?.lastElementChild;while(node&&!(node.classList?.contains("mes")&&node.hasAttribute("mesid")))node=node.previousElementSibling;const body=node?.querySelector(".mes_text");if(!body)return "";if(!body.querySelector(".pc-marker-slot,.pc-image-actions"))return body.textContent||"";const clone=body.cloneNode(true);clone.querySelectorAll(".pc-marker-slot,.pc-image-actions").forEach(el=>el.remove());return clone.textContent||"";},document:DOC,
         generate:async (prompt,meta)=>{
             const d=__mod_store.getData();
             const plan=__mod_chars.planMarker(prompt,meta);
@@ -7572,22 +7577,47 @@ function injectCss() {
 }
 
 // 聊天里每一楼加一个「生图」小按钮
-function addMesButtons() {
+function attachMesButton(mes) {
+    if (!mes) return;
+    const box = mes.querySelector('.extraMesButtons') || mes.querySelector('.mes_buttons');
+    if (!box || box.querySelector('.pc-mes-gen')) return;
+    const o = DOC.createElement('div');
+    o.className = 'mes_button pc-mes-outfit fa-solid fa-shirt interactable';
+    o.title = '智库：按这一楼的剧情设计服装';
+    o.tabIndex = 0;
+    box.prepend(o);
+    const b = DOC.createElement('div');
+    b.className = 'mes_button pc-mes-gen fa-solid fa-image interactable';
+    b.title = '智库：请在对应提示词旁点击生成';
+    b.tabIndex = 0;
+    box.prepend(b);
+}
+function addMesButtons(targetId) {
+    if (Number.isInteger(targetId)) {
+        const mes = DOC.querySelector(`#chat .mes[mesid="${targetId}"]`);
+        if (mes) { __mod_marker.decorate(targetId); attachMesButton(mes); }
+        return;
+    }
     __mod_marker.decorateAll();
-    DOC.querySelectorAll('#chat .mes').forEach(mes => {
-        const box = mes.querySelector('.extraMesButtons') || mes.querySelector('.mes_buttons');
-        if (!box || box.querySelector('.pc-mes-gen')) return;
-        const o = DOC.createElement('div');
-        o.className = 'mes_button pc-mes-outfit fa-solid fa-shirt interactable';
-        o.title = '智库：按这一楼的剧情设计服装';
-        o.tabIndex = 0;
-        box.prepend(o);
-        const b = DOC.createElement('div');
-        b.className = 'mes_button pc-mes-gen fa-solid fa-image interactable';
-        b.title = '智库：请在对应提示词旁点击生成';
-        b.tabIndex = 0;
-        box.prepend(b);
-    });
+    DOC.querySelectorAll('#chat .mes').forEach(attachMesButton);
+}
+let mesBtnTimer = null, mesBtnFull = false;
+const mesBtnQueue = new Set();
+function scheduleMesButtons(id) {
+    const n = Number(id);
+    if (id !== undefined && Number.isInteger(n) && n >= 0) mesBtnQueue.add(n);
+    else mesBtnFull = true;
+    if (mesBtnQueue.size > 6) mesBtnFull = true;
+    if (mesBtnTimer !== null) return;
+    mesBtnTimer = setTimeout(() => {
+        mesBtnTimer = null;
+        const full = mesBtnFull;
+        const ids = full ? [] : [...mesBtnQueue];
+        mesBtnFull = false;
+        mesBtnQueue.clear();
+        if (full) addMesButtons();
+        else for (const mid of ids) addMesButtons(mid);
+    }, 60);
 }
 const genning = new Set();
 async function genFor(mesId) { await __mod_marker.process(mesId, { manual: true }); }
@@ -7648,7 +7678,6 @@ async function start() {
     cleanups.push(() => charMacro.uninstall());
     __mod_marker.syncRegex();
     setTimeout(() => __mod_marker.refresh(), 0);
-    setTimeout(() => __mod_marker.refresh(), 0);
     cleanups.push(() => {__mod_marker.stop();__mod_nai.stopQueue();});
     // 第一次用：装过智绘姬的话，把 NovelAI key 和画师搬过来
     const ns = N.settings();
@@ -7662,18 +7691,31 @@ async function start() {
     UI.renderStub();
     cleanups.push(onChange(() => { UI.renderChip(); UI.renderStub(); }));
 
-    const onChat = () => setTimeout(() => { __mod_chars.invalidateCharState(); UI.renderChip(); UI.renderStub(); E.applyBindingOnChatChange(); addMesButtons(); }, 300);
+    let chatTimer = null;
+    const onChat = () => {
+        __mod_marker.pregenReset?.();
+        if (chatTimer !== null) clearTimeout(chatTimer);
+        chatTimer = setTimeout(() => { chatTimer = null; __mod_chars.invalidateCharState(); UI.renderChip(); UI.renderStub(); E.applyBindingOnChatChange(); scheduleMesButtons(); }, 250);
+    };
     DOC.addEventListener('click', onChatClick, true);
-    cleanups.push(() => { DOC.removeEventListener('click', onChatClick, true); DOC.querySelectorAll('.pc-mes-gen, .pc-mes-outfit').forEach(n => n.remove()); });
-    const onRendered = id => { setTimeout(addMesButtons, 50); };
-    const onUserRendered = id => { onRendered(id); };
-    const onEdited = id => { onRendered(id); __mod_chars.invalidateCharState(); void __mod_chars.applyCharacterBlocks(Number(id)); };
-    const onSwiped = id => { __mod_chars.invalidateCharState(); void __mod_chars.applyCharacterBlocks(Number(id)); };
+    cleanups.push(() => {
+        if (chatTimer !== null) clearTimeout(chatTimer);
+        if (mesBtnTimer !== null) clearTimeout(mesBtnTimer);
+        DOC.removeEventListener('click', onChatClick, true);
+        DOC.querySelectorAll('.pc-mes-gen, .pc-mes-outfit').forEach(n => n.remove());
+    });
+    const onRendered = id => { scheduleMesButtons(id); };
+    const onUserRendered = id => { scheduleMesButtons(id); };
+    const onEdited = id => { scheduleMesButtons(id); __mod_chars.invalidateCharState(); void __mod_chars.applyCharacterBlocks(Number(id)); };
+    const onSwiped = id => { scheduleMesButtons(id); __mod_chars.invalidateCharState(); void __mod_chars.applyCharacterBlocks(Number(id)); };
     const onDeleted = () => { __mod_chars.invalidateCharState(); };
     const onCharMsg = id => {
-        setTimeout(addMesButtons, 50);
-        setTimeout(() => { void __mod_chars.applyCharacterBlocks(Number(id)); }, 0);
-        setTimeout(() => { void __mod_marker.process(Number(id)); }, 0);
+        const n = Number(id);
+        scheduleMesButtons(n);
+        setTimeout(async () => {
+            try { await __mod_chars.applyCharacterBlocks(n); } catch (e) { console.warn('[智库] 角色块解析', e); }
+            await __mod_marker.process(n);
+        }, 0);
     };
     for (const [ev, fn] of [[event_types.USER_MESSAGE_RENDERED, onUserRendered], [event_types.CHARACTER_MESSAGE_RENDERED, onCharMsg], [event_types.MORE_MESSAGES_LOADED, onRendered], [event_types.MESSAGE_UPDATED, onEdited], [event_types.MESSAGE_SWIPED, onSwiped], [event_types.MESSAGE_DELETED, onDeleted]]) {
         if (!ev) continue;

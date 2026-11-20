@@ -77,9 +77,13 @@ export function createMarkerController({context,getData,generate,upload,notify,e
         if(!doc || stopped)return;
         const cfg=settings(),msg=context().chat?.[id];
         if(!msg)return;
-        decorateImages(id,msg);
+        const hasQs=typeof doc.querySelector==='function';
+        const mesNode=hasQs?doc.querySelector(`.mes[mesid="${Number(id)}"] .mes_text`):null;
+        if(hasQs&&!mesNode)return;
+        decorateImages(id,msg,mesNode);
+        const slots=mesNode?mesNode.querySelectorAll(':is(.pc-marker-slot,.custom-pc-marker-slot)'):doc.querySelectorAll(`.mes[mesid="${Number(id)}"] .mes_text :is(.pc-marker-slot,.custom-pc-marker-slot)`);
+        if(!slots.length)return;
         const tokens=parseImageMarkers(msg.mes,cfg.start,cfg.end);
-        const slots=doc.querySelectorAll(`.mes[mesid="${Number(id)}"] .mes_text :is(.pc-marker-slot,.custom-pc-marker-slot)`);
         slots.forEach((slot,index)=>{
             slot.classList.add('pc-marker-slot');
             const token=tokens[index];if(!token)return;
@@ -99,7 +103,7 @@ export function createMarkerController({context,getData,generate,upload,notify,e
             if(record?.url){
                 const wrapper=doc.createElement('details');wrapper.className='pc-result-collapse';
                 const header=doc.createElement('summary');
-                const img=doc.createElement('img');img.src=record.url;img.className='pc-result-image';img.alt='生成图片';
+                const img=doc.createElement('img');img.src=record.url;img.className='pc-result-image';img.alt='生成图片';img.loading='lazy';img.decoding='async';
                 wrapper.append(header,img);slot.append(wrapper);
                 // 「生成后自动展开」：只对这次刚生成的那张生效，历史图片仍旧收起
                 const fresh=freshResults.delete(recordKey(msg,token)),autoOpen=cfg.expand&&fresh;
@@ -218,8 +222,9 @@ export function createMarkerController({context,getData,generate,upload,notify,e
         remove.onclick=async()=>{try{await deleteResult(id,msg,token);dismiss();}catch(e){notify(e.message,'error');}};
         box.append(input,send,remove);
     }
-    function decorateImages(id,msg) {
-        for(const img of doc.querySelectorAll(`.mes[mesid="${Number(id)}"] .mes_text img:is(.pc-chat-img,.custom-pc-chat-img)`)) {
+    function decorateImages(id,msg,scope) {
+        const imgs=scope?scope.querySelectorAll('img:is(.pc-chat-img,.custom-pc-chat-img)'):doc.querySelectorAll(`.mes[mesid="${Number(id)}"] .mes_text img:is(.pc-chat-img,.custom-pc-chat-img)`);
+        for(const img of imgs) {
             img.classList.add('pc-chat-img');
             if(imageBindings.has(img))continue;
             imageBindings.add(img);

@@ -374,8 +374,11 @@ export function applyCharLibrary(source) {
         'getData:__mod_store.getData,expandPrompt:(prompt,meta)=>__mod_chars.expandMarkerPrompt(prompt,meta),'
         + 'getStreamingText:()=>{const c=SillyTavern.getContext();'
         + 'const live=c.streamingProcessor?.messageText;if(typeof live==="string"&&live)return live;'
-        + 'const node=[...DOC.querySelectorAll("#chat .mes[mesid]")].pop();const body=node?.querySelector(".mes_text");'
-        + 'if(!body)return "";const clone=body.cloneNode(true);'
+        + 'const chat=DOC.getElementById("chat");let node=chat?.lastElementChild;'
+        + 'while(node&&!(node.classList?.contains("mes")&&node.hasAttribute("mesid")))node=node.previousElementSibling;'
+        + 'const body=node?.querySelector(".mes_text");if(!body)return "";'
+        + 'if(!body.querySelector(".pc-marker-slot,.pc-image-actions"))return body.textContent||"";'
+        + 'const clone=body.cloneNode(true);'
         + 'clone.querySelectorAll(".pc-marker-slot,.pc-image-actions").forEach(el=>el.remove());'
         + 'return clone.textContent||"";},document:DOC,',
         'marker expand wiring');
