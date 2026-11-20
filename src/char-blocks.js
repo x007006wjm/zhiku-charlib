@@ -9,8 +9,8 @@ export const CHAT_META_KEY = 'zhiku_chat_chars';
 export const CHAR_OPS_KEY = 'zhikuCharOps';
 export const CHAR_BLOCK_TYPES = ['人物', '外貌变化'];
 
-/** 用于正则里匹配两种块（不含 $ 与反斜杠问题）。 */
-export const CHAR_BLOCK_PATTERN_SOURCE = '<(?:人物|外貌变化)>[\\s\\S]*?<\\/(?:人物|外貌变化)>';
+/** 用于正则里匹配两种块（兼容全角尖括号与全角斜杠，不含 $ 与反斜杠问题）。 */
+export const CHAR_BLOCK_PATTERN_SOURCE = '[<＜](?:人物|外貌变化)[>＞][\\s\\S]*?[<＜][/／](?:人物|外貌变化)[>＞]';
 
 /** 全角标点与全角尖括号 → 半角，便于解析。 */
 export function normalizeBlockText(text) {
@@ -428,6 +428,7 @@ export function normalizeChatEntry(raw) {
         outfitModeExplicit: raw.outfitModeExplicit === true || outfitMode === 'fixed',
         outfits,
         outfitId,
+        negative: typeof raw.negative === 'string' ? raw.negative.trim() : '',
         source: raw.source === 'ai' ? 'ai' : 'manual',
         history: normalizeHistory(raw.history),
     };
@@ -457,6 +458,7 @@ export function entryFromGlobal(character) {
         outfitMode: character?.outfitMode,
         outfits: character?.outfits,
         outfitId: character?.outfitId,
+        negative: character?.negative,
         source: 'manual',
         history: [],
     });
@@ -474,7 +476,7 @@ export function globalFromChatEntry(entry) {
         outfitMode: normalized.outfitMode,
         outfits: normalized.outfits,
         outfitId: normalized.outfitId,
-        negative: '',
+        negative: normalized.negative || '',
         charRef: '',
     };
 }
@@ -498,6 +500,7 @@ export function mergeCharacterLayers(chatEntry, globalChar) {
         outfitMode: globalChar.outfitMode === 'fixed' ? 'fixed' : 'story',
         outfits: normalizeOutfits(globalChar.outfits),
         outfitId: String(globalChar.outfitId ?? ''),
+        negative: typeof globalChar.negative === 'string' ? globalChar.negative.trim() : '',
         charRef: String(globalChar.charRef ?? ''),
     };
     const useChatAppearance = chat.appearance.length > 0;
@@ -513,6 +516,7 @@ export function mergeCharacterLayers(chatEntry, globalChar) {
         outfitMode: useChatOutfit ? chat.outfitMode : global.outfitMode,
         outfits: useChatOutfit ? chat.outfits : global.outfits,
         outfitId: useChatOutfit ? chat.outfitId : (global.outfitId || global.outfits[0]?.id || ''),
+        negative: chat.negative || global.negative,
         charRef: chat.charRef || global.charRef,
     };
     return {

@@ -8,6 +8,68 @@ function setTimeout(fn, delay, ...args) {
     timers.add(id); return id;
 }
 function clearTimeout(id) { window.clearTimeout(id); timers.delete(id); }
+// 自定义负面固定词多预设管理：纯函数，构建时内联进 runtime.js。
+const UCP_PRESET_PREFIX = 'preset:';
+
+function normalizeUcpPresets(raw) {
+    if (!Array.isArray(raw)) return [];
+    const out = [];
+    const seen = new Set();
+    for (const item of raw) {
+        if (!item || typeof item !== 'object') continue;
+        const id = String(item.id || '').trim();
+        const name = String(item.name || '').trim();
+        if (!id || !name || seen.has(id)) continue;
+        seen.add(id);
+        out.push({ id, name: name.slice(0, 32), text: String(item.text ?? '') });
+    }
+    return out;
+}
+
+function ucpPresetIdOf(value) {
+    const raw = String(value ?? '');
+    return raw.startsWith(UCP_PRESET_PREFIX) ? raw.slice(UCP_PRESET_PREFIX.length) : '';
+}
+
+function findUcpPreset(presets, ucpValue) {
+    const id = ucpPresetIdOf(ucpValue);
+    if (!id) return null;
+    return normalizeUcpPresets(presets).find(p => p.id === id) || null;
+}
+
+function resolveUcpText(settings, fallbackUcp = '') {
+    const val = String(settings?.UCP_novelai ?? '');
+    if (val === 'custom') return String(settings?.UCP_custom || '').trim();
+    const hit = findUcpPreset(settings?.UCP_presets, val);
+    if (hit) return String(hit.text || '').trim();
+    return String(fallbackUcp || '');
+}
+
+function createUcpPreset(presets, { name, text, id } = {}) {
+    const list = normalizeUcpPresets(presets);
+    const cleanName = String(name ?? '').trim().slice(0, 32) || `预设 ${list.length + 1}`;
+    const cleanId = String(id || '').trim() || `ucp_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
+    const preset = { id: cleanId, name: cleanName, text: String(text ?? '') };
+    return { presets: [...list, preset], preset, value: UCP_PRESET_PREFIX + cleanId };
+}
+
+function updateUcpPresetText(presets, id, text) {
+    const target = String(id || '').trim();
+    return normalizeUcpPresets(presets).map(p => (p.id === target ? { ...p, text: String(text ?? '') } : p));
+}
+
+function renameUcpPreset(presets, id, name) {
+    const target = String(id || '').trim();
+    const cleanName = String(name ?? '').trim().slice(0, 32);
+    if (!cleanName) return normalizeUcpPresets(presets);
+    return normalizeUcpPresets(presets).map(p => (p.id === target ? { ...p, name: cleanName } : p));
+}
+
+function deleteUcpPreset(presets, id) {
+    const target = String(id || '').trim();
+    return normalizeUcpPresets(presets).filter(p => p.id !== target);
+}
+
 // 智库 · 原生扩展版 v0.8.8（二改自从前佬的智绘姬）
 // 不需要智绘姬，填 NovelAI key 就能用。
 // NovelAI 请求格式参考了智绘姬（作者：从前跟你一样，https://github.com/damoshen123/st-chatu8，AFPL v9）。
@@ -753,6 +815,7 @@ const MODELS = [
     ['nai-diffusion-4-curated-preview', 'NAI Diffusion 4 Curated'],
     ['nai-diffusion-3', 'NAI Diffusion Anime 3'],
     ['nai-diffusion-5-full', 'NAI Diffusion 5 Full'],
+    ['nai-diffusion-5-full-medium', 'NAI Diffusion 5 Full (Medium)'],
     ['nai-diffusion-5-curated', 'NAI Diffusion 5 Curated'],
 ];
 const SAMPLERS = [
@@ -860,7 +923,7 @@ function buildParameters({ positive, negative, width, height, seed, chars = [], 
     if (isV5) {
         const k = ucpValue(s).toLowerCase();
         p.tag_hint_uc_preset = { heavy: 1, furryfocus: 2, light: 3, humanfocus: 4 }[k] ?? 0;
-        p.tag_hint_qt = 1;
+        p.tag_hint_qt = s.AQT_novelai ? 1 : 0;
         delete p.skip_cfg_above_sigma;
         delete p.noise_schedule;
         if (p.sampler === 'ddim_v3') p.sampler = 'k_euler_ancestral';
@@ -948,7 +1011,7 @@ async function generateRequest(opts) {
             width: params.width, height: params.height, negative_prompt: opts.negative, decrisper: false,
             variety_boost: !!params.skip_cfg_above_sigma, sm: false, sm_dyn: false, seed: params.seed,
         };
-        if (model.includes('nai-diffusion-5')) { body.tag_hint_uc_preset = params.tag_hint_uc_preset; body.tag_hint_qt = 1; delete body.scheduler; }
+        if (model.includes('nai-diffusion-5')) { body.tag_hint_uc_preset = params.tag_hint_uc_preset; body.tag_hint_qt = params.tag_hint_qt; delete body.scheduler; }
         const r = await http('/api/novelai/generate-image', { method: 'POST', headers: getRequestHeaders(), body: JSON.stringify(body) });
         const text = await r.text();
         if (!r.ok) throw Object.assign(new Error(explain(r.status, text, true)),{status:r.status,retryAfter:r.headers?.get('Retry-After'),retryable:r.status===500});
@@ -1190,7 +1253,13 @@ async function inpaintRequest({ image, mask, prompt, negative, width, height, st
         v4_prompt: { caption: { base_caption: prompt, char_captions: [] }, use_coords: false, use_order: true },
         v4_negative_prompt: { caption: { base_caption: negative, char_captions: [] }, use_coords: false, use_order: true },
     };
-    if (isV5) delete parameters.noise_schedule;
+    if (isV5) {
+        const k = ucpValue(s).toLowerCase();
+        parameters.tag_hint_uc_preset = { heavy: 1, furryfocus: 2, light: 3, humanfocus: 4 }[k] ?? 0;
+        parameters.tag_hint_qt = s.AQT_novelai ? 1 : 0;
+        delete parameters.noise_schedule;
+        delete parameters.skip_cfg_above_sigma;
+    }
     const r = await http(siteUrl('/ai/generate-image'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Accept: '*/*', ...(key ? { Authorization: 'Bearer ' + key } : {}) },
@@ -1223,7 +1292,7 @@ function stSettings() { return N.settings(); }
 /** 正面、负面最后会被自动加上的质量词和负面预设 */
 function extras(s = N.settings()) {
     const r = qualityPresets({ ...s, UCP_novelai: N.ucpValue(s) });
-    if (String(s.UCP_novelai) === 'custom') r.ucp = String(s.UCP_custom || '').trim();
+    r.ucp = resolveUcpText(s, r.ucp);
     return r;
 }
 
@@ -2000,6 +2069,14 @@ function charactersMacroText(cast = [], { locked } = {}) {
 // 说明：JSON 解析失败或不是对象时返回 null，调用方继续走原来的纯文本标记路径。
 
 const PUNCT_MAP = { '：': ':', '，': ',', '；': ';', '｛': '{', '｝': '}', '［': '[', '］': ']', '　': ' ' };
+const SMART_QUOTE_RE = /[“”＂]/;
+
+/** 剥离可选的 Markdown 代码围栏（如 ```json ... ```）。 */
+function stripCodeFence(input) {
+    const raw = String(input ?? '').trim();
+    const m = /^```(?:json|JSON)?\s*\r?\n?([\s\S]*?)\r?\n?```$/.exec(raw);
+    return m ? m[1].trim() : raw;
+}
 
 /** 只替换字符串外的全角标点，避免破坏 JSON 字符串内容。 */
 function normalizeJsonText(input) {
@@ -2025,8 +2102,103 @@ function normalizeJsonText(input) {
     return out;
 }
 
+/** 轻量 JSON 修复：处理字符串外的全角引号与对象/数组末尾多余逗号。 */
+function repairJsonText(input) {
+    const source = normalizeJsonText(stripCodeFence(input));
+    let quoted = '';
+    let closeQuote = '';
+    let escaped = false;
+    for (const ch of source) {
+        if (closeQuote) {
+            if (escaped) {
+                quoted += ch;
+                escaped = false;
+            } else if (ch === '\\') {
+                quoted += ch;
+                escaped = true;
+            } else if (ch === closeQuote || (closeQuote === '”' && ch === '"')) {
+                quoted += '"';
+                closeQuote = '';
+            } else {
+                quoted += ch;
+            }
+            continue;
+        }
+        if (ch === '"' || SMART_QUOTE_RE.test(ch)) {
+            closeQuote = ch === '“' ? '”' : ch;
+            quoted += '"';
+            continue;
+        }
+        quoted += ch;
+    }
+    // 去除字符串外的尾逗号（如 ,} 或 ,]）
+    let out = '';
+    let inString = false;
+    escaped = false;
+    for (let i = 0; i < quoted.length; i += 1) {
+        const ch = quoted[i];
+        if (inString) {
+            out += ch;
+            if (escaped) escaped = false;
+            else if (ch === '\\') escaped = true;
+            else if (ch === '"') inString = false;
+            continue;
+        }
+        if (ch === '"') {
+            inString = true;
+            out += ch;
+            continue;
+        }
+        if (ch === ',') {
+            let j = i + 1;
+            while (j < quoted.length && /\s/.test(quoted[j])) j += 1;
+            if (quoted[j] === '}' || quoted[j] === ']') continue;
+        }
+        out += ch;
+    }
+    return out.trim();
+}
+
 function textOf(value) {
     return typeof value === 'string' ? value.trim() : '';
+}
+
+const CENTER_PRESETS = {
+    left: { x: 0.25, y: 0.5 },
+    right: { x: 0.75, y: 0.5 },
+    center: { x: 0.5, y: 0.5 },
+    middle: { x: 0.5, y: 0.5 },
+    'top-left': { x: 0.25, y: 0.25 },
+    top: { x: 0.5, y: 0.25 },
+    'top-right': { x: 0.75, y: 0.25 },
+    'bottom-left': { x: 0.25, y: 0.75 },
+    bottom: { x: 0.5, y: 0.75 },
+    'bottom-right': { x: 0.75, y: 0.75 },
+    '左': { x: 0.25, y: 0.5 },
+    '右': { x: 0.75, y: 0.5 },
+    '中': { x: 0.5, y: 0.5 },
+};
+
+/** 解析可选的角色站位坐标（pos / center）：预设名、{x,y} 或 [x,y]，无效返回 null。 */
+function parseCharacterCenter(raw) {
+    if (raw == null) return null;
+    if (typeof raw === 'string') {
+        const key = raw.trim().toLowerCase().replace(/[\s_]+/g, '-');
+        const hit = CENTER_PRESETS[key];
+        return hit ? { ...hit } : null;
+    }
+    let x, y;
+    if (Array.isArray(raw) && raw.length >= 2) {
+        x = Number(raw[0]);
+        y = Number(raw[1]);
+    } else if (typeof raw === 'object') {
+        x = Number(raw.x);
+        y = Number(raw.y);
+    } else {
+        return null;
+    }
+    if (!Number.isFinite(x) || !Number.isFinite(y) || x < 0 || x > 1 || y < 0 || y > 1) return null;
+    return { x, y };
 }
 
 /** 把 JSON 对象整理成内部形状；没有可用内容时返回 null。 */
@@ -2044,7 +2216,12 @@ function normalizeMarkerPayload(raw) {
             const charTag = textOf(item.tag);
             const charNl = textOf(item.nl);
             if (!name || (!charTag && !charNl)) continue;
-            characters.push({ name, tag: charTag, nl: charNl });
+            const entry = { name, tag: charTag, nl: charNl };
+            const uc = textOf(item.uc ?? item.negative);
+            if (uc) entry.uc = uc;
+            const center = parseCharacterCenter(item.center ?? item.pos);
+            if (center) entry.center = center;
+            characters.push(entry);
         }
     }
     if (!tag && !nl && !characters.length) return null;
@@ -2053,18 +2230,22 @@ function normalizeMarkerPayload(raw) {
 
 /** 是不是结构化标记；不是就返回 null（调用方走纯文本）。 */
 function parseMarkerJson(text) {
-    const raw = String(text ?? '').trim();
+    const raw = stripCodeFence(text);
     if (!raw) return null;
     const normalized = normalizeJsonText(raw).trim();
-    if (!normalized.startsWith('{')) return null;
+    if (!normalized.startsWith('{') && !raw.startsWith('{')) return null;
     let data;
     try {
         data = JSON.parse(raw);
-    } catch (error) {
+    } catch {
         try {
             data = JSON.parse(normalized);
-        } catch (error2) {
-            return null;
+        } catch {
+            try {
+                data = JSON.parse(repairJsonText(raw));
+            } catch {
+                return null;
+            }
         }
     }
     return normalizeMarkerPayload(data);
@@ -2142,22 +2323,69 @@ function buildMarkerBase(payload) {
     return [textOf(payload?.tag), textOf(payload?.nl)].filter(Boolean).join(', ');
 }
 
+const CLOSE_FRAMING_RE = /^(?:close-up|upper body|portrait|face)$/i;
+const WIDE_FRAMING_RE = /^(?:full body|wide shot|medium shot|cowboy shot|lower body)$/i;
+const LOWER_OUTFIT_RE = /\b(?:shoes?|boots?|sneakers?|sandals?|heels?|high heels?|loafers?|slippers?|barefoot|footwear|socks?|knee highs?|thighhighs?|stockings?|pantyhose|tights|leggings|garter(?: straps?)?|skirts?|miniskirts?|pants|jeans|shorts|trousers|panties|underwear|anklets?|legwear)\b/i;
+
+/** 景别是否为特写 / 半身（不含全身/中景/远景）：用于过滤框外下半身/鞋袜固定服装。 */
+function isCloseFraming(baseTag) {
+    const tokens = splitTagList(baseTag);
+    if (!tokens.length) return false;
+    if (tokens.some(t => WIDE_FRAMING_RE.test(t))) return false;
+    return tokens.some(t => CLOSE_FRAMING_RE.test(t));
+}
+
+/** 景别冲突例外：特写/半身时从库里的固定服装中移除鞋、袜、裤袜、裙、裤等框外部位。 */
+function filterOutfitForFraming(outfitTags, baseTag) {
+    if (!outfitTags || !isCloseFraming(baseTag)) return String(outfitTags ?? '').trim();
+    return splitTagList(outfitTags)
+        .filter(token => !LOWER_OUTFIT_RE.test(token))
+        .join(', ');
+}
+
+function mergeUniqueTags(...parts) {
+    const seen = new Set();
+    const out = [];
+    for (const part of parts) {
+        for (const token of splitTagList(part)) {
+            const key = tagKey(token);
+            if (!key || seen.has(key)) continue;
+            seen.add(key);
+            out.push(token);
+        }
+    }
+    return out.join(', ');
+}
+
 /**
- * 组装一条结构化标记：base + 每个角色（可查询库）的最终 caption。
- * options.lookup(name) → { tags, nl, charRef } | null
+ * 组装一条结构化标记：base + 每个角色（可查询库）的最终 caption、uc、center。
+ * options.lookup(name) → { tags, appearanceTags?, outfitTags?, nl, uc?, charRef } | null
  * options.expand(text) → 展开 $名字$
  */
 function buildMarkerPlan(payload, { lookup = () => null, expand = value => value } = {}) {
     const base = expand(buildMarkerBase(payload));
+    const baseTag = textOf(payload?.tag);
     const characters = [];
     const charRefs = [];
     for (const entry of payload?.characters || []) {
         const info = lookup(entry.name);
         let tag = expand(entry.tag || '');
-        const libraryTags = info?.tags ? expand(info.tags) : '';
+        let libraryTags = '';
+        if (info) {
+            if (info.appearanceTags !== undefined || info.outfitTags !== undefined) {
+                const app = info.appearanceTags ? expand(info.appearanceTags) : '';
+                const outfit = info.outfitTags ? filterOutfitForFraming(expand(info.outfitTags), baseTag) : '';
+                libraryTags = [app, outfit].filter(Boolean).join(', ');
+            } else if (info.tags) {
+                libraryTags = expand(info.tags);
+            }
+        }
         if (libraryTags) tag = injectLibraryTags(tag, libraryTags);
         const caption = buildCharacterCaption(tag, info?.nl || '', expand(entry.nl || ''));
-        characters.push({ name: entry.name, tag, caption, charRef: info?.charRef || '' });
+        const uc = mergeUniqueTags(info?.uc ? expand(info.uc) : '', entry.uc ? expand(entry.uc) : '');
+        const charObj = { name: entry.name, tag, caption, uc, charRef: info?.charRef || '' };
+        if (entry.center) charObj.center = entry.center;
+        characters.push(charObj);
         if (info?.charRef) charRefs.push(info.charRef);
     }
     const captions = characters.map(item => item.caption).filter(Boolean);
@@ -2196,8 +2424,8 @@ const CHAT_META_KEY = 'zhiku_chat_chars';
 const CHAR_OPS_KEY = 'zhikuCharOps';
 const CHAR_BLOCK_TYPES = ['人物', '外貌变化'];
 
-/** 用于正则里匹配两种块（不含 $ 与反斜杠问题）。 */
-const CHAR_BLOCK_PATTERN_SOURCE = '<(?:人物|外貌变化)>[\\s\\S]*?<\\/(?:人物|外貌变化)>';
+/** 用于正则里匹配两种块（兼容全角尖括号与全角斜杠，不含 $ 与反斜杠问题）。 */
+const CHAR_BLOCK_PATTERN_SOURCE = '[<＜](?:人物|外貌变化)[>＞][\\s\\S]*?[<＜][/／](?:人物|外貌变化)[>＞]';
 
 /** 全角标点与全角尖括号 → 半角，便于解析。 */
 function normalizeBlockText(text) {
@@ -2615,6 +2843,7 @@ function normalizeChatEntry(raw) {
         outfitModeExplicit: raw.outfitModeExplicit === true || outfitMode === 'fixed',
         outfits,
         outfitId,
+        negative: typeof raw.negative === 'string' ? raw.negative.trim() : '',
         source: raw.source === 'ai' ? 'ai' : 'manual',
         history: normalizeHistory(raw.history),
     };
@@ -2644,6 +2873,7 @@ function entryFromGlobal(character) {
         outfitMode: character?.outfitMode,
         outfits: character?.outfits,
         outfitId: character?.outfitId,
+        negative: character?.negative,
         source: 'manual',
         history: [],
     });
@@ -2661,7 +2891,7 @@ function globalFromChatEntry(entry) {
         outfitMode: normalized.outfitMode,
         outfits: normalized.outfits,
         outfitId: normalized.outfitId,
-        negative: '',
+        negative: normalized.negative || '',
         charRef: '',
     };
 }
@@ -2685,6 +2915,7 @@ function mergeCharacterLayers(chatEntry, globalChar) {
         outfitMode: globalChar.outfitMode === 'fixed' ? 'fixed' : 'story',
         outfits: normalizeOutfits(globalChar.outfits),
         outfitId: String(globalChar.outfitId ?? ''),
+        negative: typeof globalChar.negative === 'string' ? globalChar.negative.trim() : '',
         charRef: String(globalChar.charRef ?? ''),
     };
     const useChatAppearance = chat.appearance.length > 0;
@@ -2700,6 +2931,7 @@ function mergeCharacterLayers(chatEntry, globalChar) {
         outfitMode: useChatOutfit ? chat.outfitMode : global.outfitMode,
         outfits: useChatOutfit ? chat.outfits : global.outfits,
         outfitId: useChatOutfit ? chat.outfitId : (global.outfitId || global.outfits[0]?.id || ''),
+        negative: chat.negative || global.negative,
         charRef: chat.charRef || global.charRef,
     };
     return {
@@ -3439,7 +3671,14 @@ function markerPlanFor(text, meta = {}) {
         const key = String(name ?? '').trim().toLowerCase();
         const found = chatIndex.get(key) || globalIndex.get(key);
         if (!found) return null;
-        return { tags: fixedTagsOf(found), nl: String(found.nl || '').trim(), charRef: String(found.charRef || '') };
+        return {
+            tags: fixedTagsOf(found),
+            appearanceTags: tagText(found.appearance),
+            outfitTags: found.outfitMode === 'fixed' ? tagText(currentOutfitOf(found)?.tags) : '',
+            nl: String(found.nl || '').trim(),
+            uc: String(found.negative || '').trim(),
+            charRef: String(found.charRef || ''),
+        };
     };
     const expand = value => expandCharacterRefs(value, {
         chatEntries,
@@ -3491,7 +3730,7 @@ const CHAT_IMG_PATTERN='<img\\b[^>]*(?:pc-chat-img|画师库生成)[^>]*>';
 const MARKER_REGEX_ID = '72c57f73-46af-46ac-a28e-bf31b131332a';
 const MARKER_DISPLAY_ID = '6ba93a8e-cabb-494c-a7e8-6c9dfcf5fb80';
 const CHAR_BLOCK_DISPLAY_ID = 'a7c1d9b4-2f5e-4c6a-9d31-8b0f4e2a5c77';
-const CHAR_BLOCK_RE_SOURCE = '<(?:人物|外貌变化)>[\\s\\S]*?<\\/(?:人物|外貌变化)>';
+const CHAR_BLOCK_RE_SOURCE = '[<＜](?:人物|外貌变化)[>＞][\\s\\S]*?[<＜][/／](?:人物|外貌变化)[>＞]';
 function escapeMarker(value) { return value.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&'); }
 function markerPattern(start, end) { return escapeMarker(start) + '[\\s\\S]*?' + escapeMarker(end); }
 function parseImageMarkers(text, start, end) {
@@ -3811,20 +4050,22 @@ const __mod_marker=createMarkerController({
             const base=plan?plan.base:prompt;
             const {positive,negative}=__mod_engine.composeStudio({pos:__mod_model.mergeTags(d.active?__mod_model.ticketString(d,d.active):'',base),neg:[d.active?__mod_model.ticketNeg(d,d.active):'',d.options.chatNegative||''].filter(Boolean).join(', ')});
             let finalPositive=positive;
-            let chars=plan?plan.characters.map(entry=>({prompt:entry.caption,uc:''})):[];
+            let finalNegative=negative;
+            let chars=plan?plan.characters.map(entry=>({prompt:entry.caption,uc:entry.uc||'',...(entry.center?{center:entry.center}:{}) })):[];
             let width;
             let height;
             if(plan){
                 const nai=__mod_nai.settings();
                 if(String(nai.novelaimode)==='nai-diffusion-3'||nai.naiMode==='tavern'){
                     finalPositive=__mod_model.mergeTags(positive,...chars.map(entry=>entry.prompt));
+                    finalNegative=__mod_model.mergeTags(negative,...chars.map(entry=>entry.uc).filter(Boolean));
                     chars=[];
                 }
                 const swapped=swapSizeForOrientation(plan.size,Number(nai.novelai_width),Number(nai.novelai_height));
                 if(swapped.width){ width=swapped.width; height=swapped.height; }
             }
             const bound=[...new Set([...__mod_chars.currentCast().filter(x=>x.on).map(x=>x.char.charRef),...(plan?plan.charRefs:[])].filter(id=>id&&d.charRefGroups?.[id]))];
-            const image=await __mod_engine.generateFull({positive:finalPositive,negative,chars,width,height,director:bound.length?await __mod_engine.charRefs(bound):undefined});
+            const image=await __mod_engine.generateFull({positive:finalPositive,negative:finalNegative,chars,width,height,director:bound.length?await __mod_engine.charRefs(bound):undefined});
             __mod_engine.afterChatImage();
             return image;
         },
@@ -4045,7 +4286,7 @@ function previewHtml(s) {
 
 function ucpOptions(s) {
     const v5 = String(s.novelaimode || '').includes('nai-diffusion-5');
-    const o = [['', '不加'], ['custom', '自定义'], ['Heavy', '重（Heavy）'], ['Light', '轻（Light）']];
+    const o = [['', '不加'], ['custom', '自定义'], ...normalizeUcpPresets(s.UCP_presets).map(p => [UCP_PRESET_PREFIX + p.id, '预设 · ' + p.name]), ['Heavy', '重（Heavy）'], ['Light', '轻（Light）']];
     if (v5 || ['nai-diffusion-3', 'nai-diffusion-4-5-full'].includes(s.novelaimode)) o.push(['Human Focus', '人物（Human Focus）']);
     if (v5 || s.novelaimode === 'nai-diffusion-4-5-full') o.push(['Furry Focus', '兽人（Furry Focus）']);
     return o;
@@ -4160,8 +4401,19 @@ function viewStudio(d) {
       <label class="pc-switch"><input type="checkbox" data-aqt ${String(s.AQT_novelai ?? '') !== '' ? 'checked' : ''}><span></span>质量词（加在正面最后）<small>${pv.aqt ? esc(pv.aqt) : '现在不加'}</small></label>
       <label class="pc-field"><span>负面预设（加在负面最前面）</span>
         <select data-st="UCP_novelai">${ucpOptions(s).map(([v, t]) => `<option value="${esc(v)}" ${v === ucpVal ? 'selected' : ''}>${t}</option>`).join('')}</select></label>
-      ${ucpVal === 'custom' ? `<textarea class="pc-textarea small mono" data-ucp-custom placeholder="自己写的固定负面，比如 lowres, bad hands, watermark, text">${esc(s.UCP_custom || '')}</textarea>
-      <div class="pc-hint">每次出图都加在负面最前面：生图页、聊天标记出图、例图、试穿都带上。</div>` : pv.ucp ? `<p class="pc-quote small mono">${esc(pv.ucp)}</p>` : ''}`)}
+      ${(() => {
+        const up = findUcpPreset(s.UCP_presets, ucpVal);
+        if (ucpVal === 'custom' || up) {
+          const val = up ? up.text : (s.UCP_custom || '');
+          return `<textarea class="pc-textarea small mono" data-ucp-custom placeholder="自己写的固定负面，比如 lowres, bad hands, watermark, text">${esc(val)}</textarea>
+          <div class="pc-actions wrap pc-mt-s">
+            <button class="pc-pill tiny on" data-act="ucp-saveas">${up ? '另存为新预设' : '另存为预设'}</button>
+            ${up ? '<button class="pc-pill tiny" data-act="ucp-rename">改名</button><button class="pc-pill tiny danger" data-act="ucp-del">删除预设</button>' : ''}
+          </div>
+          <div class="pc-hint">每次出图都加在负面最前面：生图页、聊天标记出图、例图、试穿都带上。${up ? '修改当前预设会自动保存。' : ''}</div>`;
+        }
+        return pv.ucp ? `<p class="pc-quote small mono">${esc(pv.ucp)}</p><div class="pc-actions wrap pc-mt-s"><button class="pc-pill tiny" data-act="ucp-saveas">另存为自定义预设</button></div>` : '';
+      })()}`)}
     ${fold('params', '更多参数', `步数 ${s.novelai_steps} · 种子 ${Number(s.novelai_seed) > 0 ? s.novelai_seed : '随机'} · ${w}×${h}`, paramFields(s, { withSize: true }))}
     ${fold('preview', '将会发送的内容', '正面 + 固定提示词 + 质量词，负面预设 + 负面', `
       <div class="pc-label" style="margin-top:0">正面</div><p class="pc-quote small mono" id="pc-pv-pos">${pv.pos || '（空）'}</p>
@@ -5831,9 +6083,9 @@ function viewSettings(d) {
 
     const about = setFold('about', '关于', '智库 v' + (globalThis.__PC_VERSION || ''), `
       <style>.pc-about-card{text-align:center;padding:22px 10px 10px;border-radius:16px;background:radial-gradient(circle at 50% 0,rgba(201,138,62,.22),transparent 70%)}.pc-about-name{font-family:var(--pc-font-name);font-size:34px;font-weight:800;letter-spacing:.3em;padding-left:.3em;color:var(--pc-ink)}.pc-about-card .pc-subtitle{font-size:13px;margin-top:4px}.pc-about-ver{display:block;margin-top:12px;font:11px var(--pc-font-label);letter-spacing:.25em;color:var(--pc-ink-soft);text-transform:uppercase}.pc-about-card .pc-actions{justify-content:center;margin-top:14px}.pc-about-note{text-align:center;font-size:12px;color:var(--pc-ink-soft);margin-top:12px;line-height:1.7}</style>
-      <div class="pc-about-card"><div class="pc-about-name">智库</div><div class="pc-subtitle">二改自从前佬的智绘姬</div>
+      <div class="pc-about-card"><div class="pc-about-name">智库</div><div class="pc-subtitle">二改自从前佬的智绘姬 · 角色外观库版</div>
         <span class="pc-about-ver">v${esc(globalThis.__PC_VERSION || '')} · if love</span>
-        <div class="pc-actions wrap"><a class="pc-btn dark" href="https://github.com/ruoege49-ship-it/zhiku-tavern-helper" target="_blank" rel="noopener">仓库 / 更新</a><a class="pc-btn" href="https://github.com/damoshen123/st-chatu8" target="_blank" rel="noopener">智绘姬原仓库</a></div></div>
+        <div class="pc-actions wrap"><a class="pc-btn dark" href="https://github.com/x007006wjm/zhiku-charlib" target="_blank" rel="noopener">仓库 / 更新</a><a class="pc-btn" href="https://github.com/damoshen123/st-chatu8" target="_blank" rel="noopener">智绘姬原仓库</a></div></div>
       <div class="pc-about-note">看图提取需要能识图的模型 · 原脚本 AFPL v9，署名保留</div>`);
 
     return `<h2 class="pc-pagetitle">设置</h2><div class="pc-marker-primary" style="padding:16px;margin-bottom:16px;border-radius:14px;background:var(--SmartThemeBlurTintColor,rgba(128,128,128,.12))">${sw('markerAuto', '开启标记自动生图', '默认开启 · 回复出现完整生图标记时自动生成，提示词默认折叠')}${sw('markerCharExpand', '标记里展开 $角色名$', '把 $名字$ 换成该角色的固定外貌（外貌 tag + 固定衣服）')}${sw('charAutoBlocks', '从回复自动建档 / 记录外貌变化', '解析回复里的 &lt;人物&gt; / &lt;外貌变化&gt;，按楼层生效')}${sw('charBlockToast', '建档时提示', '每楼最多一条小提示')}${sw('markerResultExpand', '生成后自动展开图片', '默认开启 · 新生成的图片直接展开；历史图片仍然收起，点标题即可展开 / 收起')}${sw('markerStream', '流式预生成', '默认开启 · 回复还在流、标记一写完整就先发生图请求，正文写完时图片往往已经好了')}</div>${chat}${nai}${ai}${tpl}${entry}${share}${ban}${data}${about}<div style="height:24px"></div>`;
@@ -5957,6 +6209,44 @@ async function onClick(ev, outside = false) {
                 break;
             }
             case 'clearresult': ui.studio.result = null; ui.studio.sent = null; render(); break;
+            case 'ucp-saveas': {
+                const ns = N.settings();
+                const cur = findUcpPreset(ns.UCP_presets, ns.UCP_novelai);
+                const text = cur ? cur.text : resolveUcpText(ns, E.extras(ns).ucp);
+                if (!String(text || '').trim()) { toastr.warning('当前负面固定词是空的', '智库'); break; }
+                const defName = cur ? cur.name + ' 副本' : `负面预设 ${normalizeUcpPresets(ns.UCP_presets).length + 1}`;
+                const name = await promptText('给这个负面固定词预设起个名字', defName);
+                if (name == null) break;
+                const created = createUcpPreset(ns.UCP_presets, { name, text });
+                ns.UCP_presets = created.presets;
+                ns.UCP_novelai = created.value;
+                N.save(); render();
+                toastr.success(`已保存负面预设「${created.preset.name}」`, '智库');
+                break;
+            }
+            case 'ucp-rename': {
+                const ns = N.settings();
+                const cur = findUcpPreset(ns.UCP_presets, ns.UCP_novelai);
+                if (!cur) break;
+                const name = await promptText('修改负面预设名称', cur.name);
+                if (name == null || !name.trim()) break;
+                ns.UCP_presets = renameUcpPreset(ns.UCP_presets, cur.id, name);
+                N.save(); render();
+                toastr.success('已改名', '智库');
+                break;
+            }
+            case 'ucp-del': {
+                const ns = N.settings();
+                const cur = findUcpPreset(ns.UCP_presets, ns.UCP_novelai);
+                if (!cur) break;
+                if (!await confirmBox(`删掉负面预设「${cur.name}」？（内容会保留到「自定义」里）`, { ok: '删除' })) break;
+                ns.UCP_custom = cur.text;
+                ns.UCP_presets = deleteUcpPreset(ns.UCP_presets, cur.id);
+                ns.UCP_novelai = 'custom';
+                N.save(); render();
+                toastr.success('已删除预设，内容已保留在自定义中', '智库');
+                break;
+            }
             case 'strtoggle': ui.strOpen[el.dataset.key] = !ui.strOpen[el.dataset.key]; render(); break;
             case 'addprefix': {
                 const names = el.dataset.name ? [el.dataset.name] : guessBareArtists(d, ui.studio.pos);
@@ -6372,7 +6662,7 @@ function setPath(obj, path, val) {
 function onInput(ev) {
     const el = ev.target;
     const d = getData();
-    if (el.dataset.ucpCustom !== undefined) { N.settings().UCP_custom = el.value; N.save(); updateStudioPreview(); return; }
+    if (el.dataset.ucpCustom !== undefined) { const ns = N.settings(); const pid = ucpPresetIdOf(ns.UCP_novelai); if (pid) ns.UCP_presets = updateUcpPresetText(ns.UCP_presets, pid, el.value); else ns.UCP_custom = el.value; N.save(); updateStudioPreview(); return; }
     if (el.dataset.bind) {
         setPath(ui, el.dataset.bind, el.value);
         if (el.dataset.bind === 'studio.pos') { const w = root.querySelector('#pc-pos-ban'); if (w) w.innerHTML = banWarn(getData(), el.value); }

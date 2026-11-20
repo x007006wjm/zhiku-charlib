@@ -161,11 +161,13 @@ const ctx = { chat: [], chatId: 'x', extensionSettings: { regex: [] }, saveSetti
 const controller = createMarkerController({ context: () => ctx, getData: () => ({ options: {} }), generate: async () => 'x', upload: async () => ({ url: '' }), notify() {} });
 controller.syncRegex();
 const stripRule = ctx.extensionSettings.regex.find(r => r.id === MARKER_REGEX_ID);
-assert(stripRule.findRegex.includes('<(?:人物|外貌变化)>'));
+assert(stripRule.findRegex.includes('(?:人物|外貌变化)'));
 assert.equal('x <人物>\n名字: 甲\n</人物> y <外貌变化>\n名字: 甲\n</外貌变化> z'.replace(new RegExp(stripRule.findRegex.slice(1, -2), 'g'), ''), 'x  y  z');
+assert.equal('a ＜人物＞\n名字：甲\n＜／人物＞ b ＜外貌变化＞\n名字：甲\n＜／外貌变化＞ c'.replace(new RegExp(stripRule.findRegex.slice(1, -2), 'g'), ''), 'a  b  c');
 const blockRule = ctx.extensionSettings.regex.find(r => r.id === CHAR_BLOCK_DISPLAY_ID);
 assert(blockRule && blockRule.markdownOnly && !blockRule.promptOnly);
 assert('<人物>\n名字: 甲\n</人物>'.replace(new RegExp(blockRule.findRegex.slice(1, -2), 'g'), blockRule.replaceString).includes('角色档案'));
+assert('＜人物＞\n名字：甲\n＜／人物＞'.replace(new RegExp(blockRule.findRegex.slice(1, -2), 'g'), blockRule.replaceString).includes('角色档案'));
 controller.stop();
 
 // ───────── 11. 缓存键随编辑变化 ─────────

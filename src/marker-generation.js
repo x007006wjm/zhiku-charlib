@@ -4,7 +4,7 @@ export const CHAT_IMG_PATTERN='<img\\b[^>]*(?:pc-chat-img|画师库生成)[^>]*>
 export const MARKER_REGEX_ID = '72c57f73-46af-46ac-a28e-bf31b131332a';
 export const MARKER_DISPLAY_ID = '6ba93a8e-cabb-494c-a7e8-6c9dfcf5fb80';
 export const CHAR_BLOCK_DISPLAY_ID = 'a7c1d9b4-2f5e-4c6a-9d31-8b0f4e2a5c77';
-export const CHAR_BLOCK_RE_SOURCE = '<(?:人物|外貌变化)>[\\s\\S]*?<\\/(?:人物|外貌变化)>';
+export const CHAR_BLOCK_RE_SOURCE = '[<＜](?:人物|外貌变化)[>＞][\\s\\S]*?[<＜][/／](?:人物|外貌变化)[>＞]';
 export function escapeMarker(value) { return value.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&'); }
 export function markerPattern(start, end) { return escapeMarker(start) + '[\\s\\S]*?' + escapeMarker(end); }
 export function parseImageMarkers(text, start, end) {

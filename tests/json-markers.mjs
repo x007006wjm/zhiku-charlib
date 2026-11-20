@@ -1,9 +1,10 @@
 // JSON 生图标记：image###{tag,nl,characters[],size}### 的解析、库注入、size 交换、v3 回落与记录。
 import assert from 'node:assert/strict';
 import {
-    normalizeJsonText, parseMarkerJson, normalizeMarkerPayload, splitTagList,
+    normalizeJsonText, repairJsonText, parseMarkerJson, normalizeMarkerPayload, splitTagList,
     injectLibraryTags, convertCountTags, buildCharacterCaption, buildMarkerBase,
     buildMarkerPlan, swapSizeForOrientation, appendCaptionsToBase,
+    parseCharacterCenter, isCloseFraming, filterOutfitForFraming,
 } from '../src/char-marker-json.js';
 import { buildCharacterIndex, fixedTagsOf, expandCharacterRefs, charactersMacroText } from '../src/char-expand.js';
 import { deriveTimeline, normalizeChatEntry } from '../src/char-blocks.js';
@@ -148,4 +149,57 @@ assert.equal(record.prompt, 'READABLE PLAN');
 assert.equal(msg.mes, raw, '消息原文不变');
 ctrl.stop();
 
-console.log('PASS: JSON marker parse/fallback (full-width), base composition, library injection order + dedupe, count-tag conversion, fixed vs story outfit, chat layer by floor, unknown passthrough, v3 fallback, size swap, charRef, stored readable prompt, macro suffixes, controller record.');
+// ───────── 9. V5 / 容错增强：代码围栏、尾逗号、全角引号、站位坐标、角色专属 uc、景别冲突过滤 ─────────
+// 9a. Markdown 代码围栏 + 尾逗号 + 全角引号
+const fenced = '```json\n{"tag":"1girl, upper body, indoor, soft sunlight, warm colors,","characters":[{"name":"小雪","tag":"girl, smiling","nl":"warm smile",},],"size":"portrait",}\n```';
+const fencedParsed = parseMarkerJson(fenced);
+assert(fencedParsed && fencedParsed.size === 'portrait' && fencedParsed.characters.length === 1);
+const smartQuoted = '｛“tag”：“1girl, solo”，“size”：“landscape”，｝';
+const smartParsed = parseMarkerJson(smartQuoted);
+assert(smartParsed && smartParsed.tag === '1girl, solo' && smartParsed.size === 'landscape');
+assert.equal(repairJsonText('{"a":1,}'), '{"a":1}');
+
+// 9b. 站位坐标（pos / center）
+assert.deepEqual(parseCharacterCenter('left'), { x: 0.25, y: 0.5 });
+assert.deepEqual(parseCharacterCenter('右'), { x: 0.75, y: 0.5 });
+assert.deepEqual(parseCharacterCenter([0.2, 0.8]), { x: 0.2, y: 0.8 });
+assert.deepEqual(parseCharacterCenter({ x: 0.6, y: 0.4 }), { x: 0.6, y: 0.4 });
+assert.equal(parseCharacterCenter([1.5, 0.5]), null);
+const posPayload = parseMarkerJson('{"tag":"2girls, medium shot","characters":[{"name":"小雪","tag":"girl","pos":"left","uc":"short hair"},{"name":"队长","tag":"girl","center":[0.8,0.5]}]}');
+assert.deepEqual(posPayload.characters[0].center, { x: 0.25, y: 0.5 });
+assert.deepEqual(posPayload.characters[1].center, { x: 0.8, y: 0.5 });
+assert.equal(posPayload.characters[0].uc, 'short hair');
+
+// 9c. 角色专属 uc（库 negative + JSON uc 合并去重）与景别冲突过滤（upper body / close-up 移除框外鞋袜裙裤）
+assert.equal(isCloseFraming('1girl, upper body, indoor'), true);
+assert.equal(isCloseFraming('1girl, close-up, soft sunlight'), true);
+assert.equal(isCloseFraming('2girls, medium shot, rooftop'), false);
+assert.equal(isCloseFraming('1girl, full body, portrait'), false);
+assert.equal(
+    filterOutfitForFraming('white blouse, pleated skirt, pantyhose, black shoes, red ribbon', '1girl, upper body, indoor'),
+    'white blouse, red ribbon',
+);
+assert.equal(
+    filterOutfitForFraming('white blouse, pleated skirt, pantyhose, black shoes', '1girl, full body, indoor'),
+    'white blouse, pleated skirt, pantyhose, black shoes',
+);
+const framingPlan = buildMarkerPlan(
+    parseMarkerJson('{"tag":"1girl, upper body, cafe, soft sunlight, warm colors","nl":"A close shot at a cafe.","characters":[{"name":"小雪","tag":"girl, smiling","nl":"smiling warmly","pos":"center","uc":"hat, short hair"}],"size":"portrait"}'),
+    {
+        lookup: name => name === '小雪' ? {
+            appearanceTags: '1girl, long black hair, blue eyes',
+            outfitTags: 'white blouse, pleated skirt, pantyhose, black shoes',
+            nl: 'a slender girl with long black hair',
+            uc: 'short hair, glasses',
+            charRef: 'g-xue',
+        } : null,
+    },
+);
+assert(framingPlan.characters[0].caption.includes('white blouse'));
+assert(!framingPlan.characters[0].caption.includes('pantyhose'));
+assert(!framingPlan.characters[0].caption.includes('black shoes'));
+assert(!framingPlan.characters[0].caption.includes('pleated skirt'));
+assert.equal(framingPlan.characters[0].uc, 'short hair, glasses, hat');
+assert.deepEqual(framingPlan.characters[0].center, { x: 0.5, y: 0.5 });
+
+console.log('PASS: JSON marker parse/fallback (full-width/fenced/trailing-comma), base composition, library injection order + dedupe, count-tag conversion, fixed vs story outfit, chat layer by floor, unknown passthrough, v3 fallback, size swap, charRef, uc, center, close-framing outfit filter, stored readable prompt, macro suffixes, controller record.');

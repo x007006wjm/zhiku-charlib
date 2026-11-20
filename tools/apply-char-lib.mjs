@@ -205,7 +205,14 @@ function markerPlanFor(text, meta = {}) {
         const key = String(name ?? '').trim().toLowerCase();
         const found = chatIndex.get(key) || globalIndex.get(key);
         if (!found) return null;
-        return { tags: fixedTagsOf(found), nl: String(found.nl || '').trim(), charRef: String(found.charRef || '') };
+        return {
+            tags: fixedTagsOf(found),
+            appearanceTags: tagText(found.appearance),
+            outfitTags: found.outfitMode === 'fixed' ? tagText(currentOutfitOf(found)?.tags) : '',
+            nl: String(found.nl || '').trim(),
+            uc: String(found.negative || '').trim(),
+            charRef: String(found.charRef || ''),
+        };
     };
     const expand = value => expandCharacterRefs(value, {
         chatEntries,
@@ -382,20 +389,22 @@ export function applyCharLibrary(source) {
             const base=plan?plan.base:prompt;
             const {positive,negative}=__mod_engine.composeStudio({pos:__mod_model.mergeTags(d.active?__mod_model.ticketString(d,d.active):'',base),neg:[d.active?__mod_model.ticketNeg(d,d.active):'',d.options.chatNegative||''].filter(Boolean).join(', ')});
             let finalPositive=positive;
-            let chars=plan?plan.characters.map(entry=>({prompt:entry.caption,uc:''})):[];
+            let finalNegative=negative;
+            let chars=plan?plan.characters.map(entry=>({prompt:entry.caption,uc:entry.uc||'',...(entry.center?{center:entry.center}:{}) })):[];
             let width;
             let height;
             if(plan){
                 const nai=__mod_nai.settings();
                 if(String(nai.novelaimode)==='nai-diffusion-3'||nai.naiMode==='tavern'){
                     finalPositive=__mod_model.mergeTags(positive,...chars.map(entry=>entry.prompt));
+                    finalNegative=__mod_model.mergeTags(negative,...chars.map(entry=>entry.uc).filter(Boolean));
                     chars=[];
                 }
                 const swapped=swapSizeForOrientation(plan.size,Number(nai.novelai_width),Number(nai.novelai_height));
                 if(swapped.width){ width=swapped.width; height=swapped.height; }
             }
             const bound=[...new Set([...__mod_chars.currentCast().filter(x=>x.on).map(x=>x.char.charRef),...(plan?plan.charRefs:[])].filter(id=>id&&d.charRefGroups?.[id]))];
-            const image=await __mod_engine.generateFull({positive:finalPositive,negative,chars,width,height,director:bound.length?await __mod_engine.charRefs(bound):undefined});
+            const image=await __mod_engine.generateFull({positive:finalPositive,negative:finalNegative,chars,width,height,director:bound.length?await __mod_engine.charRefs(bound):undefined});
             __mod_engine.afterChatImage();
             return image;
         },`,

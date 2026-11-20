@@ -13,7 +13,7 @@ controller.syncRegex();controller.syncRegex();
 assert.equal(c.extensionSettings.regex.length,4);
 let rule=c.extensionSettings.regex.find(r=>r.id===MARKER_REGEX_ID);
 assert(rule.promptOnly&&!rule.markdownOnly&&!rule.runOnEdit);assert.deepEqual(rule.placement,[1,2]);
-assert(rule.findRegex.includes('<(?:人物|外貌变化)>'),'不发送规则要含角色块');
+assert(rule.findRegex.includes('(?:人物|外貌变化)'),'不发送规则要含角色块');
 const blockRule=c.extensionSettings.regex.find(r=>r.id===CHAR_BLOCK_DISPLAY_ID);
 assert(blockRule&&blockRule.markdownOnly&&!blockRule.promptOnly,'角色块折叠规则');
 assert.equal('x <人物>\n名字: 甲\n</人物> y <外貌变化>\n名字: 甲\n</外貌变化> z'.replace(new RegExp(rule.findRegex.slice(1,-2),'g'),''),'x  y  z');

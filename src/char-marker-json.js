@@ -4,6 +4,14 @@
 // 说明：JSON 解析失败或不是对象时返回 null，调用方继续走原来的纯文本标记路径。
 
 const PUNCT_MAP = { '：': ':', '，': ',', '；': ';', '｛': '{', '｝': '}', '［': '[', '］': ']', '　': ' ' };
+const SMART_QUOTE_RE = /[“”＂]/;
+
+/** 剥离可选的 Markdown 代码围栏（如 ```json ... ```）。 */
+function stripCodeFence(input) {
+    const raw = String(input ?? '').trim();
+    const m = /^```(?:json|JSON)?\s*\r?\n?([\s\S]*?)\r?\n?```$/.exec(raw);
+    return m ? m[1].trim() : raw;
+}
 
 /** 只替换字符串外的全角标点，避免破坏 JSON 字符串内容。 */
 export function normalizeJsonText(input) {
@@ -29,8 +37,103 @@ export function normalizeJsonText(input) {
     return out;
 }
 
+/** 轻量 JSON 修复：处理字符串外的全角引号与对象/数组末尾多余逗号。 */
+export function repairJsonText(input) {
+    const source = normalizeJsonText(stripCodeFence(input));
+    let quoted = '';
+    let closeQuote = '';
+    let escaped = false;
+    for (const ch of source) {
+        if (closeQuote) {
+            if (escaped) {
+                quoted += ch;
+                escaped = false;
+            } else if (ch === '\\') {
+                quoted += ch;
+                escaped = true;
+            } else if (ch === closeQuote || (closeQuote === '”' && ch === '"')) {
+                quoted += '"';
+                closeQuote = '';
+            } else {
+                quoted += ch;
+            }
+            continue;
+        }
+        if (ch === '"' || SMART_QUOTE_RE.test(ch)) {
+            closeQuote = ch === '“' ? '”' : ch;
+            quoted += '"';
+            continue;
+        }
+        quoted += ch;
+    }
+    // 去除字符串外的尾逗号（如 ,} 或 ,]）
+    let out = '';
+    let inString = false;
+    escaped = false;
+    for (let i = 0; i < quoted.length; i += 1) {
+        const ch = quoted[i];
+        if (inString) {
+            out += ch;
+            if (escaped) escaped = false;
+            else if (ch === '\\') escaped = true;
+            else if (ch === '"') inString = false;
+            continue;
+        }
+        if (ch === '"') {
+            inString = true;
+            out += ch;
+            continue;
+        }
+        if (ch === ',') {
+            let j = i + 1;
+            while (j < quoted.length && /\s/.test(quoted[j])) j += 1;
+            if (quoted[j] === '}' || quoted[j] === ']') continue;
+        }
+        out += ch;
+    }
+    return out.trim();
+}
+
 function textOf(value) {
     return typeof value === 'string' ? value.trim() : '';
+}
+
+const CENTER_PRESETS = {
+    left: { x: 0.25, y: 0.5 },
+    right: { x: 0.75, y: 0.5 },
+    center: { x: 0.5, y: 0.5 },
+    middle: { x: 0.5, y: 0.5 },
+    'top-left': { x: 0.25, y: 0.25 },
+    top: { x: 0.5, y: 0.25 },
+    'top-right': { x: 0.75, y: 0.25 },
+    'bottom-left': { x: 0.25, y: 0.75 },
+    bottom: { x: 0.5, y: 0.75 },
+    'bottom-right': { x: 0.75, y: 0.75 },
+    '左': { x: 0.25, y: 0.5 },
+    '右': { x: 0.75, y: 0.5 },
+    '中': { x: 0.5, y: 0.5 },
+};
+
+/** 解析可选的角色站位坐标（pos / center）：预设名、{x,y} 或 [x,y]，无效返回 null。 */
+export function parseCharacterCenter(raw) {
+    if (raw == null) return null;
+    if (typeof raw === 'string') {
+        const key = raw.trim().toLowerCase().replace(/[\s_]+/g, '-');
+        const hit = CENTER_PRESETS[key];
+        return hit ? { ...hit } : null;
+    }
+    let x, y;
+    if (Array.isArray(raw) && raw.length >= 2) {
+        x = Number(raw[0]);
+        y = Number(raw[1]);
+    } else if (typeof raw === 'object') {
+        x = Number(raw.x);
+        y = Number(raw.y);
+    } else {
+        return null;
+    }
+    if (!Number.isFinite(x) || !Number.isFinite(y) || x < 0 || x > 1 || y < 0 || y > 1) return null;
+    return { x, y };
 }
 
 /** 把 JSON 对象整理成内部形状；没有可用内容时返回 null。 */
@@ -48,7 +151,12 @@ export function normalizeMarkerPayload(raw) {
             const charTag = textOf(item.tag);
             const charNl = textOf(item.nl);
             if (!name || (!charTag && !charNl)) continue;
-            characters.push({ name, tag: charTag, nl: charNl });
+            const entry = { name, tag: charTag, nl: charNl };
+            const uc = textOf(item.uc ?? item.negative);
+            if (uc) entry.uc = uc;
+            const center = parseCharacterCenter(item.center ?? item.pos);
+            if (center) entry.center = center;
+            characters.push(entry);
         }
     }
     if (!tag && !nl && !characters.length) return null;
@@ -57,18 +165,22 @@ export function normalizeMarkerPayload(raw) {
 
 /** 是不是结构化标记；不是就返回 null（调用方走纯文本）。 */
 export function parseMarkerJson(text) {
-    const raw = String(text ?? '').trim();
+    const raw = stripCodeFence(text);
     if (!raw) return null;
     const normalized = normalizeJsonText(raw).trim();
-    if (!normalized.startsWith('{')) return null;
+    if (!normalized.startsWith('{') && !raw.startsWith('{')) return null;
     let data;
     try {
         data = JSON.parse(raw);
-    } catch (error) {
+    } catch {
         try {
             data = JSON.parse(normalized);
-        } catch (error2) {
-            return null;
+        } catch {
+            try {
+                data = JSON.parse(repairJsonText(raw));
+            } catch {
+                return null;
+            }
         }
     }
     return normalizeMarkerPayload(data);
@@ -146,22 +258,69 @@ export function buildMarkerBase(payload) {
     return [textOf(payload?.tag), textOf(payload?.nl)].filter(Boolean).join(', ');
 }
 
+const CLOSE_FRAMING_RE = /^(?:close-up|upper body|portrait|face)$/i;
+const WIDE_FRAMING_RE = /^(?:full body|wide shot|medium shot|cowboy shot|lower body)$/i;
+const LOWER_OUTFIT_RE = /\b(?:shoes?|boots?|sneakers?|sandals?|heels?|high heels?|loafers?|slippers?|barefoot|footwear|socks?|knee highs?|thighhighs?|stockings?|pantyhose|tights|leggings|garter(?: straps?)?|skirts?|miniskirts?|pants|jeans|shorts|trousers|panties|underwear|anklets?|legwear)\b/i;
+
+/** 景别是否为特写 / 半身（不含全身/中景/远景）：用于过滤框外下半身/鞋袜固定服装。 */
+export function isCloseFraming(baseTag) {
+    const tokens = splitTagList(baseTag);
+    if (!tokens.length) return false;
+    if (tokens.some(t => WIDE_FRAMING_RE.test(t))) return false;
+    return tokens.some(t => CLOSE_FRAMING_RE.test(t));
+}
+
+/** 景别冲突例外：特写/半身时从库里的固定服装中移除鞋、袜、裤袜、裙、裤等框外部位。 */
+export function filterOutfitForFraming(outfitTags, baseTag) {
+    if (!outfitTags || !isCloseFraming(baseTag)) return String(outfitTags ?? '').trim();
+    return splitTagList(outfitTags)
+        .filter(token => !LOWER_OUTFIT_RE.test(token))
+        .join(', ');
+}
+
+function mergeUniqueTags(...parts) {
+    const seen = new Set();
+    const out = [];
+    for (const part of parts) {
+        for (const token of splitTagList(part)) {
+            const key = tagKey(token);
+            if (!key || seen.has(key)) continue;
+            seen.add(key);
+            out.push(token);
+        }
+    }
+    return out.join(', ');
+}
+
 /**
- * 组装一条结构化标记：base + 每个角色（可查询库）的最终 caption。
- * options.lookup(name) → { tags, nl, charRef } | null
+ * 组装一条结构化标记：base + 每个角色（可查询库）的最终 caption、uc、center。
+ * options.lookup(name) → { tags, appearanceTags?, outfitTags?, nl, uc?, charRef } | null
  * options.expand(text) → 展开 $名字$
  */
 export function buildMarkerPlan(payload, { lookup = () => null, expand = value => value } = {}) {
     const base = expand(buildMarkerBase(payload));
+    const baseTag = textOf(payload?.tag);
     const characters = [];
     const charRefs = [];
     for (const entry of payload?.characters || []) {
         const info = lookup(entry.name);
         let tag = expand(entry.tag || '');
-        const libraryTags = info?.tags ? expand(info.tags) : '';
+        let libraryTags = '';
+        if (info) {
+            if (info.appearanceTags !== undefined || info.outfitTags !== undefined) {
+                const app = info.appearanceTags ? expand(info.appearanceTags) : '';
+                const outfit = info.outfitTags ? filterOutfitForFraming(expand(info.outfitTags), baseTag) : '';
+                libraryTags = [app, outfit].filter(Boolean).join(', ');
+            } else if (info.tags) {
+                libraryTags = expand(info.tags);
+            }
+        }
         if (libraryTags) tag = injectLibraryTags(tag, libraryTags);
         const caption = buildCharacterCaption(tag, info?.nl || '', expand(entry.nl || ''));
-        characters.push({ name: entry.name, tag, caption, charRef: info?.charRef || '' });
+        const uc = mergeUniqueTags(info?.uc ? expand(info.uc) : '', entry.uc ? expand(entry.uc) : '');
+        const charObj = { name: entry.name, tag, caption, uc, charRef: info?.charRef || '' };
+        if (entry.center) charObj.center = entry.center;
+        characters.push(charObj);
         if (info?.charRef) charRefs.push(info.charRef);
     }
     const captions = characters.map(item => item.caption).filter(Boolean);

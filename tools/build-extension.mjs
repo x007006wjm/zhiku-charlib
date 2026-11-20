@@ -19,6 +19,14 @@ patch("{status:r.status,retryAfter:r.headers?.get('Retry-After')});\n        let
 patch("if (status >= 500) return 'NovelAI 服务器出错了，过一会再试（' + status + '）';","if (status >= 500) return 'NovelAI 服务器出错了，过一会再试（' + status + '）' + (viaTavern ? '。用酒馆里的 key 时，请求太快也会显示成这个' : '');");
 // 编码氛围也走同一个队列
 patch('async function encodeVibe(imageB64, infoExtracted = 1, model = settings().novelaimode) {','function encodeVibe(...args){return __naiGate.run(()=>encodeVibeRequest(...args));}\nasync function encodeVibeRequest(imageB64, infoExtracted = 1, model = settings().novelaimode) {');
+// NovelAI V5 适配补齐：补充 V5 Full (Medium)、tag_hint_qt 随质量词开关联动、局部重绘 V5 参数清理
+patch("    ['nai-diffusion-5-full', 'NAI Diffusion 5 Full'],\n    ['nai-diffusion-5-curated', 'NAI Diffusion 5 Curated'],",
+      "    ['nai-diffusion-5-full', 'NAI Diffusion 5 Full'],\n    ['nai-diffusion-5-full-medium', 'NAI Diffusion 5 Full (Medium)'],\n    ['nai-diffusion-5-curated', 'NAI Diffusion 5 Curated'],");
+patch('        p.tag_hint_qt = 1;', '        p.tag_hint_qt = s.AQT_novelai ? 1 : 0;');
+patch("        if (model.includes('nai-diffusion-5')) { body.tag_hint_uc_preset = params.tag_hint_uc_preset; body.tag_hint_qt = 1; delete body.scheduler; }",
+      "        if (model.includes('nai-diffusion-5')) { body.tag_hint_uc_preset = params.tag_hint_uc_preset; body.tag_hint_qt = params.tag_hint_qt; delete body.scheduler; }");
+patch('    if (isV5) delete parameters.noise_schedule;',
+      "    if (isV5) {\n        const k = ucpValue(s).toLowerCase();\n        parameters.tag_hint_uc_preset = { heavy: 1, furryfocus: 2, light: 3, humanfocus: 4 }[k] ?? 0;\n        parameters.tag_hint_qt = s.AQT_novelai ? 1 : 0;\n        delete parameters.noise_schedule;\n        delete parameters.skip_cfg_above_sigma;\n    }");
 // 关于：名片样式
 {
   const a=s.indexOf("    const about = setFold('about', '关于'");
@@ -26,9 +34,9 @@ patch('async function encodeVibe(imageB64, infoExtracted = 1, model = settings()
   assert(a>0&&b>a);
   patch(s.slice(a,b),`    const about = setFold('about', '关于', '智库 v' + (globalThis.__PC_VERSION || ''), \`
       <style>.pc-about-card{text-align:center;padding:22px 10px 10px;border-radius:16px;background:radial-gradient(circle at 50% 0,rgba(201,138,62,.22),transparent 70%)}.pc-about-name{font-family:var(--pc-font-name);font-size:34px;font-weight:800;letter-spacing:.3em;padding-left:.3em;color:var(--pc-ink)}.pc-about-card .pc-subtitle{font-size:13px;margin-top:4px}.pc-about-ver{display:block;margin-top:12px;font:11px var(--pc-font-label);letter-spacing:.25em;color:var(--pc-ink-soft);text-transform:uppercase}.pc-about-card .pc-actions{justify-content:center;margin-top:14px}.pc-about-note{text-align:center;font-size:12px;color:var(--pc-ink-soft);margin-top:12px;line-height:1.7}</style>
-      <div class="pc-about-card"><div class="pc-about-name">智库</div><div class="pc-subtitle">二改自从前佬的智绘姬</div>
+      <div class="pc-about-card"><div class="pc-about-name">智库</div><div class="pc-subtitle">二改自从前佬的智绘姬 · 角色外观库版</div>
         <span class="pc-about-ver">v\${esc(globalThis.__PC_VERSION || '')} · if love</span>
-        <div class="pc-actions wrap"><a class="pc-btn dark" href="https://github.com/ruoege49-ship-it/zhiku-tavern-helper" target="_blank" rel="noopener">仓库 / 更新</a><a class="pc-btn" href="https://github.com/damoshen123/st-chatu8" target="_blank" rel="noopener">智绘姬原仓库</a></div></div>
+        <div class="pc-actions wrap"><a class="pc-btn dark" href="https://github.com/x007006wjm/zhiku-charlib" target="_blank" rel="noopener">仓库 / 更新</a><a class="pc-btn" href="https://github.com/damoshen123/st-chatu8" target="_blank" rel="noopener">智绘姬原仓库</a></div></div>
       <div class="pc-about-note">看图提取需要能识图的模型 · 原脚本 AFPL v9，署名保留</div>\`);`);
 }
 // 只用一次 / 每张换一个：聊天里出一张图之后才生效（以前没接上）
@@ -183,6 +191,74 @@ return {
 };
 `);
 s=applyUxFixes(s);
+// 自定义负面固定词多预设（另存为预设 / 切换 / 改名 / 删除）
+{
+    const ucpHelper = fs.readFileSync('src/ucp-presets.js', 'utf8').replace(/^export\s+/gm, '');
+    s = ucpHelper + '\n' + s;
+    patch("if (String(s.UCP_novelai) === 'custom') r.ucp = String(s.UCP_custom || '').trim();",
+        "r.ucp = resolveUcpText(s, r.ucp);");
+    patch("    const o = [['', '不加'], ['custom', '自定义'], ['Heavy', '重（Heavy）'], ['Light', '轻（Light）']];",
+        "    const o = [['', '不加'], ['custom', '自定义'], ...normalizeUcpPresets(s.UCP_presets).map(p => [UCP_PRESET_PREFIX + p.id, '预设 · ' + p.name]), ['Heavy', '重（Heavy）'], ['Light', '轻（Light）']];");
+    patch(
+        `      \${ucpVal === 'custom' ? \`<textarea class="pc-textarea small mono" data-ucp-custom placeholder="自己写的固定负面，比如 lowres, bad hands, watermark, text">\${esc(s.UCP_custom || '')}</textarea>
+      <div class="pc-hint">每次出图都加在负面最前面：生图页、聊天标记出图、例图、试穿都带上。</div>\` : pv.ucp ? \`<p class="pc-quote small mono">\${esc(pv.ucp)}</p>\` : ''}\`)}`,
+        `      \${(() => {
+        const up = findUcpPreset(s.UCP_presets, ucpVal);
+        if (ucpVal === 'custom' || up) {
+          const val = up ? up.text : (s.UCP_custom || '');
+          return \`<textarea class="pc-textarea small mono" data-ucp-custom placeholder="自己写的固定负面，比如 lowres, bad hands, watermark, text">\${esc(val)}</textarea>
+          <div class="pc-actions wrap pc-mt-s">
+            <button class="pc-pill tiny on" data-act="ucp-saveas">\${up ? '另存为新预设' : '另存为预设'}</button>
+            \${up ? '<button class="pc-pill tiny" data-act="ucp-rename">改名</button><button class="pc-pill tiny danger" data-act="ucp-del">删除预设</button>' : ''}
+          </div>
+          <div class="pc-hint">每次出图都加在负面最前面：生图页、聊天标记出图、例图、试穿都带上。\${up ? '修改当前预设会自动保存。' : ''}</div>\`;
+        }
+        return pv.ucp ? \`<p class="pc-quote small mono">\${esc(pv.ucp)}</p><div class="pc-actions wrap pc-mt-s"><button class="pc-pill tiny" data-act="ucp-saveas">另存为自定义预设</button></div>\` : '';
+      })()}\`)}`
+    );
+    patch("if (el.dataset.ucpCustom !== undefined) { N.settings().UCP_custom = el.value; N.save(); updateStudioPreview(); return; }",
+        "if (el.dataset.ucpCustom !== undefined) { const ns = N.settings(); const pid = ucpPresetIdOf(ns.UCP_novelai); if (pid) ns.UCP_presets = updateUcpPresetText(ns.UCP_presets, pid, el.value); else ns.UCP_custom = el.value; N.save(); updateStudioPreview(); return; }");
+    patch("case 'clearresult': ui.studio.result = null; ui.studio.sent = null; render(); break;",
+        `case 'clearresult': ui.studio.result = null; ui.studio.sent = null; render(); break;
+            case 'ucp-saveas': {
+                const ns = N.settings();
+                const cur = findUcpPreset(ns.UCP_presets, ns.UCP_novelai);
+                const text = cur ? cur.text : resolveUcpText(ns, E.extras(ns).ucp);
+                if (!String(text || '').trim()) { toastr.warning('当前负面固定词是空的', '智库'); break; }
+                const defName = cur ? cur.name + ' 副本' : \`负面预设 \${normalizeUcpPresets(ns.UCP_presets).length + 1}\`;
+                const name = await promptText('给这个负面固定词预设起个名字', defName);
+                if (name == null) break;
+                const created = createUcpPreset(ns.UCP_presets, { name, text });
+                ns.UCP_presets = created.presets;
+                ns.UCP_novelai = created.value;
+                N.save(); render();
+                toastr.success(\`已保存负面预设「\${created.preset.name}」\`, '智库');
+                break;
+            }
+            case 'ucp-rename': {
+                const ns = N.settings();
+                const cur = findUcpPreset(ns.UCP_presets, ns.UCP_novelai);
+                if (!cur) break;
+                const name = await promptText('修改负面预设名称', cur.name);
+                if (name == null || !name.trim()) break;
+                ns.UCP_presets = renameUcpPreset(ns.UCP_presets, cur.id, name);
+                N.save(); render();
+                toastr.success('已改名', '智库');
+                break;
+            }
+            case 'ucp-del': {
+                const ns = N.settings();
+                const cur = findUcpPreset(ns.UCP_presets, ns.UCP_novelai);
+                if (!cur) break;
+                if (!await confirmBox(\`删掉负面预设「\${cur.name}」？（内容会保留到「自定义」里）\`, { ok: '删除' })) break;
+                ns.UCP_custom = cur.text;
+                ns.UCP_presets = deleteUcpPreset(ns.UCP_presets, cur.id);
+                ns.UCP_novelai = 'custom';
+                N.save(); render();
+                toastr.success('已删除预设，内容已保留在自定义中', '智库');
+                break;
+            }`);
+}
 // 角色外观库：$名字$ 展开、别名、世界书宏 {{zhiku_characters}}、开关与界面提示
 s=applyCharLibrary(s);
 const prefix=`// Generated from the full script; edit build-extension.mjs and shared-upload.js.
