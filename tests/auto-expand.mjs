@@ -138,4 +138,30 @@ function setup({expand} = {}) {
     restored.stop();
 }
 
-console.log('PASS: 生成后自动展开（默认开、只展开一次、历史图片收起、开关关闭、stop 清理）。');
+// 6) saveChat() 进行中若并发触发 decorate（例如同楼多张图或 60ms 按钮刷新），仍能正常自动展开
+{
+    const doc = makeDoc();
+    const data = {options: {}};
+    const msg = {mes: 'a image###sunset### b', swipe_id: 0, swipes: []};
+    msg.swipes = [msg.mes];
+    let controller = null;
+    const chat = {
+        chat: [msg], chatId: 'one', extensionSettings: {},
+        saveSettingsDebounced() {},
+        async saveChat() { controller.decorate(0); },
+        updateMessageBlock() {},
+    };
+    controller = createMarkerController({
+        context: () => chat, getData: () => data,
+        generate: async () => 'data:image/png;base64,x',
+        upload: async () => ({url: '/user/images/race.png'}),
+        notify() {}, document: doc,
+    });
+    const slot = doc.addSlot();
+    await controller.process(0, {manual: true});
+    assert.equal(panel(slot)?.open, true, 'saveChat 期间并发 decorate 不能吞掉自动展开');
+    assert.equal(summaryOf(slot)?.textContent, '图片 · 点击收起');
+    controller.stop();
+}
+
+console.log('PASS: 生成后自动展开（默认开、只展开一次、历史图片收起、开关关闭、stop 清理、saveChat 并发渲染竞态）。');

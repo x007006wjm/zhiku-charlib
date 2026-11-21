@@ -70,7 +70,7 @@ function deleteUcpPreset(presets, id) {
     return normalizeUcpPresets(presets).filter(p => p.id !== target);
 }
 
-// 智库 · 原生扩展版 v0.8.12（二改自从前佬的智绘姬）
+// 智库 · 原生扩展版 v0.8.13（二改自从前佬的智绘姬）
 // 不需要智绘姬，填 NovelAI key 就能用。
 // NovelAI 请求格式参考了智绘姬（作者：从前跟你一样，https://github.com/damoshen123/st-chatu8，AFPL v9）。
 const P = (() => { try { if (window.parent && window.parent !== window && window.parent.document) return window.parent; } catch (e) { /* 跨域 */ } return window; })();
@@ -88,7 +88,7 @@ const __shim = {
     get extension_settings() { return __ctx().extensionSettings; },
 };
 
-globalThis.__PC_VERSION = '0.8.12';
+globalThis.__PC_VERSION = '0.8.13';
 
 // ───── model.js ─────
 const __mod_model = (() => {
@@ -3818,9 +3818,17 @@ function createMarkerController({context,getData,generate,upload,notify,expandPr
         slots.forEach((slot,index)=>{
             slot.classList.add('pc-marker-slot');
             const token=tokens[index];if(!token)return;
-            const record=msg.extra?.zhikuImages?.[recordKey(msg,token)];
+            const key=recordKey(msg,token);
+            const record=msg.extra?.zhikuImages?.[key];
             const ready=token.raw+'|'+(record?.url||'');
-            if(slot.dataset.pcReady===ready) { const b=slot.querySelector('button');if(b){b.disabled=!!state(msg,token);b.textContent=label(msg,token,record);}return; }
+            if(slot.dataset.pcReady===ready) {
+                const b=slot.querySelector('button');if(b){b.disabled=!!state(msg,token);b.textContent=label(msg,token,record);}
+                if(record?.url&&cfg.expand&&freshResults.delete(key)){
+                    const w=slot.querySelector('.pc-result-collapse');
+                    if(w){w.open=true;const h=w.querySelector('summary');if(h)h.textContent='图片 · 点击收起';}
+                }
+                return;
+            }
             slot.dataset.pcReady=ready;
             slot.replaceChildren();
             const details=doc.createElement('details'),summary=doc.createElement('summary'),pre=doc.createElement('pre'),button=doc.createElement('button');
@@ -4159,9 +4167,10 @@ function createMarkerController({context,getData,generate,upload,notify,expandPr
                     entry.state='保存中…';decorate(id);
                     const {url}=await upload(image,'marker_'+Date.now());if(!current())return 0;
                     if(!url)throw new Error('图片上传未返回地址');
-                    const hadExtra=!!msg.extra;msg.extra ||= {};const hadRecords=!!msg.extra.zhikuImages,records=msg.extra.zhikuImages ||= {},old=records[key];records[key]={url:String(url),prompt:recordPrompt};
-                    try{await c.saveChat();}catch(e){if(old)records[key]=old;else delete records[key];if(!hadRecords&&!Object.keys(records).length)delete msg.extra.zhikuImages;if(!hadExtra&&!Object.keys(msg.extra).length)delete msg.extra;throw e;}
-                    failed.get(msg)?.delete(key);freshResults.add(key);
+                    const hadExtra=!!msg.extra;msg.extra ||= {};const hadRecords=!!msg.extra.zhikuImages,records=msg.extra.zhikuImages ||= {},old=records[key];
+                    freshResults.add(key);records[key]={url:String(url),prompt:recordPrompt};
+                    try{await c.saveChat();}catch(e){freshResults.delete(key);if(old)records[key]=old;else delete records[key];if(!hadRecords&&!Object.keys(records).length)delete msg.extra.zhikuImages;if(!hadExtra&&!Object.keys(msg.extra).length)delete msg.extra;throw e;}
+                    failed.get(msg)?.delete(key);
                     notify(reuse?'已插入流式预生成图片':'图片生成完成','success');
                     return 1;
                 }catch(e){let errors=failed.get(msg);if(!errors){errors=new Set();failed.set(msg,errors);}errors.add(key);notify(e.message||String(e),'error');return 0;}

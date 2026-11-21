@@ -92,9 +92,17 @@ export function createMarkerController({context,getData,generate,upload,notify,e
         slots.forEach((slot,index)=>{
             slot.classList.add('pc-marker-slot');
             const token=tokens[index];if(!token)return;
-            const record=msg.extra?.zhikuImages?.[recordKey(msg,token)];
+            const key=recordKey(msg,token);
+            const record=msg.extra?.zhikuImages?.[key];
             const ready=token.raw+'|'+(record?.url||'');
-            if(slot.dataset.pcReady===ready) { const b=slot.querySelector('button');if(b){b.disabled=!!state(msg,token);b.textContent=label(msg,token,record);}return; }
+            if(slot.dataset.pcReady===ready) {
+                const b=slot.querySelector('button');if(b){b.disabled=!!state(msg,token);b.textContent=label(msg,token,record);}
+                if(record?.url&&cfg.expand&&freshResults.delete(key)){
+                    const w=slot.querySelector('.pc-result-collapse');
+                    if(w){w.open=true;const h=w.querySelector('summary');if(h)h.textContent='图片 · 点击收起';}
+                }
+                return;
+            }
             slot.dataset.pcReady=ready;
             slot.replaceChildren();
             const details=doc.createElement('details'),summary=doc.createElement('summary'),pre=doc.createElement('pre'),button=doc.createElement('button');
@@ -433,9 +441,10 @@ export function createMarkerController({context,getData,generate,upload,notify,e
                     entry.state='保存中…';decorate(id);
                     const {url}=await upload(image,'marker_'+Date.now());if(!current())return 0;
                     if(!url)throw new Error('图片上传未返回地址');
-                    const hadExtra=!!msg.extra;msg.extra ||= {};const hadRecords=!!msg.extra.zhikuImages,records=msg.extra.zhikuImages ||= {},old=records[key];records[key]={url:String(url),prompt:recordPrompt};
-                    try{await c.saveChat();}catch(e){if(old)records[key]=old;else delete records[key];if(!hadRecords&&!Object.keys(records).length)delete msg.extra.zhikuImages;if(!hadExtra&&!Object.keys(msg.extra).length)delete msg.extra;throw e;}
-                    failed.get(msg)?.delete(key);freshResults.add(key);
+                    const hadExtra=!!msg.extra;msg.extra ||= {};const hadRecords=!!msg.extra.zhikuImages,records=msg.extra.zhikuImages ||= {},old=records[key];
+                    freshResults.add(key);records[key]={url:String(url),prompt:recordPrompt};
+                    try{await c.saveChat();}catch(e){freshResults.delete(key);if(old)records[key]=old;else delete records[key];if(!hadRecords&&!Object.keys(records).length)delete msg.extra.zhikuImages;if(!hadExtra&&!Object.keys(msg.extra).length)delete msg.extra;throw e;}
+                    failed.get(msg)?.delete(key);
                     notify(reuse?'已插入流式预生成图片':'图片生成完成','success');
                     return 1;
                 }catch(e){let errors=failed.get(msg);if(!errors){errors=new Set();failed.set(msg,errors);}errors.add(key);notify(e.message||String(e),'error');return 0;}
