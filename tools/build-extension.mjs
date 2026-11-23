@@ -6,7 +6,7 @@ import {applyCharLibrary} from './apply-char-lib.mjs';
 import {fileURLToPath} from 'node:url';
 process.chdir(fileURLToPath(new URL('../', import.meta.url)));
 const dir='.';
-const VERSION='0.8.13';
+const VERSION='0.8.14';
 let s=applyMarkers(JSON.parse(fs.readFileSync('zhiku.script.json','utf8')).content);
 function patch(a,b){assert.equal(s.split(a).length,2,a.slice(0,80));s=s.replace(a,()=>b);}
 patch("globalThis.__PC_VERSION = '0.6.3';", `globalThis.__PC_VERSION = '${VERSION}';`);
@@ -192,10 +192,23 @@ return {
 };
 `);
 s=applyUxFixes(s);
-// 自定义负面固定词多预设（另存为预设 / 切换 / 改名 / 删除）
+// 自定义负面固定词多预设（另存为预设 / 切换 / 改名 / 删除）+ NovelAI 数值权重末尾空格防护
 {
     const ucpHelper = fs.readFileSync('src/ucp-presets.js', 'utf8').replace(/^export\s+/gm, '');
-    s = ucpHelper + '\n' + s;
+    const weightHelper = fs.readFileSync('src/weight-guard.js', 'utf8').replace(/^export\s+/gm, '');
+    s = weightHelper + '\n' + ucpHelper + '\n' + s;
+    patch("    return Math.abs(t.weight - 1) < 0.001 ? t.text : `${fmtWeight(t.weight)}::${t.text}::`;",
+        "    return Math.abs(t.weight - 1) < 0.001 ? t.text : formatWeightTag(fmtWeight(t.weight), t.text);");
+    patch("        .map(({ a, w }) => Math.abs(w - 1) < 0.001 ? a.tag : `${fmtWeight(w)}::${a.tag}::`);",
+        "        .map(({ a, w }) => Math.abs(w - 1) < 0.001 ? a.tag : formatWeightTag(fmtWeight(w), a.tag));");
+    patch("        .map(t => t.raw || (Math.abs(t.weight - 1) < 0.001 ? t.text : `${M.fmtWeight(t.weight)}::${t.text}::`)).join(', ');",
+        "        .map(t => t.raw ? guardWeightSpacing(t.raw) : (Math.abs(t.weight - 1) < 0.001 ? t.text : formatWeightTag(M.fmtWeight(t.weight), t.text))).join(', ');");
+    patch("function buildParameters({ positive, negative, width, height, seed, chars = [], refs = null, director = null }) {",
+        "function buildParameters({ positive, negative, width, height, seed, chars = [], refs = null, director = null }) {\n    positive = guardWeightSpacing(positive);\n    negative = guardWeightSpacing(negative);\n    chars = (chars || []).map(c => ({ ...c, prompt: guardWeightSpacing(c.prompt), uc: guardWeightSpacing(c.uc || '') }));");
+    patch("        body: JSON.stringify({ input: opts.positive, model, action: 'generate', parameters: params, use_new_shared_trial: true }),",
+        "        body: JSON.stringify({ input: guardWeightSpacing(opts.positive), model, action: 'generate', parameters: params, use_new_shared_trial: true }),");
+    patch("            prompt: opts.positive, model, sampler: params.sampler, scheduler: params.noise_schedule, steps: params.steps, scale: params.scale,\n            width: params.width, height: params.height, negative_prompt: opts.negative, decrisper: false,",
+        "            prompt: guardWeightSpacing(opts.positive), model, sampler: params.sampler, scheduler: params.noise_schedule, steps: params.steps, scale: params.scale,\n            width: params.width, height: params.height, negative_prompt: guardWeightSpacing(opts.negative), decrisper: false,");
     patch("if (String(s.UCP_novelai) === 'custom') r.ucp = String(s.UCP_custom || '').trim();",
         "r.ucp = resolveUcpText(s, r.ucp);");
     patch("    const o = [['', '不加'], ['custom', '自定义'], ['Heavy', '重（Heavy）'], ['Light', '轻（Light）']];",

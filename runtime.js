@@ -8,6 +8,27 @@ function setTimeout(fn, delay, ...args) {
     timers.add(id); return id;
 }
 function clearTimeout(id) { window.clearTimeout(id); timers.delete(id); }
+// NovelAI 数值权重语法防护：
+// 当权重块 `w::内容::` 的内容以数字（或 . : -）结尾时（如 `0.5::artist:bm94199::`、`1.2::year 2024::`），
+// 若 `::` 前没有空格，NovelAI 解析器会把末尾数字与 `::` 误判为嵌套权重导致权重爆炸。
+// 本模块保证这类标签在拼接、格式化和最终发送前一律保留/补齐 `::` 前的保护空格。
+
+const WEIGHT_TAIL_RE = /(-?\d+(?:\.\d+)?::(?:(?!::)[\s\S])*?[\d.:\-])(::)/g;
+
+/** 给文本中所有以数字/符号结尾的 `w::...::` 权重块补齐 `::` 前的保护空格（已有空格则不重复加）。 */
+function guardWeightSpacing(text) {
+    const src = String(text ?? '');
+    if (!src.includes('::')) return src;
+    return src.replace(WEIGHT_TAIL_RE, '$1 $2');
+}
+
+/** 格式化单个权重标签：权重为 1 返回原文，否则按需在 `::` 前保留保护空格。 */
+function formatWeightTag(weightStr, text) {
+    const body = String(text ?? '');
+    const pad = /[\d.:\-]$/.test(body) ? ' ' : '';
+    return `${weightStr}::${body}${pad}::`;
+}
+
 // 自定义负面固定词多预设管理：纯函数，构建时内联进 runtime.js。
 const UCP_PRESET_PREFIX = 'preset:';
 
@@ -70,7 +91,7 @@ function deleteUcpPreset(presets, id) {
     return normalizeUcpPresets(presets).filter(p => p.id !== target);
 }
 
-// 智库 · 原生扩展版 v0.8.13（二改自从前佬的智绘姬）
+// 智库 · 原生扩展版 v0.8.14（二改自从前佬的智绘姬）
 // 不需要智绘姬，填 NovelAI key 就能用。
 // NovelAI 请求格式参考了智绘姬（作者：从前跟你一样，https://github.com/damoshen123/st-chatu8，AFPL v9）。
 const P = (() => { try { if (window.parent && window.parent !== window && window.parent.document) return window.parent; } catch (e) { /* 跨域 */ } return window; })();
@@ -88,7 +109,7 @@ const __shim = {
     get extension_settings() { return __ctx().extensionSettings; },
 };
 
-globalThis.__PC_VERSION = '0.8.13';
+globalThis.__PC_VERSION = '0.8.14';
 
 // ───── model.js ─────
 const __mod_model = (() => {
@@ -292,7 +313,7 @@ function tokenize(text) {
 
 function tokenToText(t) {
     if (t.raw) return t.raw;
-    return Math.abs(t.weight - 1) < 0.001 ? t.text : `${fmtWeight(t.weight)}::${t.text}::`;
+    return Math.abs(t.weight - 1) < 0.001 ? t.text : formatWeightTag(fmtWeight(t.weight), t.text);
 }
 
 /** 画师串 → { members: [{tag, weight}], extra } */
@@ -448,7 +469,7 @@ function ticketString(data, ref) {
     const parts = t.item.members
         .map(m => ({ a: data.artists[m.artistId], w: Number(m.weight) || 1 }))
         .filter(x => x.a)
-        .map(({ a, w }) => Math.abs(w - 1) < 0.001 ? a.tag : `${fmtWeight(w)}::${a.tag}::`);
+        .map(({ a, w }) => Math.abs(w - 1) < 0.001 ? a.tag : formatWeightTag(fmtWeight(w), a.tag));
     if (t.item.extra) parts.push(t.item.extra);
     return parts.join(', ');
 }
@@ -877,6 +898,9 @@ function skipSigma(w, h, model) {
  * refs：{ images:[base64], strengths:[], infos:[] }（氛围，可不填）
  */
 function buildParameters({ positive, negative, width, height, seed, chars = [], refs = null, director = null }) {
+    positive = guardWeightSpacing(positive);
+    negative = guardWeightSpacing(negative);
+    chars = (chars || []).map(c => ({ ...c, prompt: guardWeightSpacing(c.prompt), uc: guardWeightSpacing(c.uc || '') }));
     const s = settings();
     const model = s.novelaimode;
     const isV3 = model === 'nai-diffusion-3';
@@ -1007,8 +1031,8 @@ async function generateRequest(opts) {
     };
     if (s.naiMode === 'tavern') {
         const body = {
-            prompt: opts.positive, model, sampler: params.sampler, scheduler: params.noise_schedule, steps: params.steps, scale: params.scale,
-            width: params.width, height: params.height, negative_prompt: opts.negative, decrisper: false,
+            prompt: guardWeightSpacing(opts.positive), model, sampler: params.sampler, scheduler: params.noise_schedule, steps: params.steps, scale: params.scale,
+            width: params.width, height: params.height, negative_prompt: guardWeightSpacing(opts.negative), decrisper: false,
             variety_boost: !!params.skip_cfg_above_sigma, sm: false, sm_dyn: false, seed: params.seed,
         };
         if (model.includes('nai-diffusion-5')) { body.tag_hint_uc_preset = params.tag_hint_uc_preset; body.tag_hint_qt = params.tag_hint_qt; delete body.scheduler; }
@@ -1023,7 +1047,7 @@ async function generateRequest(opts) {
     const r = await http(siteUrl('/ai/generate-image'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Accept: '*/*', ...(key ? { Authorization: 'Bearer ' + key } : {}) },
-        body: JSON.stringify({ input: opts.positive, model, action: 'generate', parameters: params, use_new_shared_trial: true }),
+        body: JSON.stringify({ input: guardWeightSpacing(opts.positive), model, action: 'generate', parameters: params, use_new_shared_trial: true }),
     });
     const buf = new Uint8Array(await r.arrayBuffer());
     if (!r.ok) throw Object.assign(new Error(explain(r.status, new TextDecoder().decode(buf))),{status:r.status,retryAfter:r.headers?.get('Retry-After')});
@@ -1308,7 +1332,7 @@ const joinTags = arr => arr.map(x => stripNotes(x).trim().replace(/^,+|,+$/g, ''
 function dropRepeats(text, ...before) {
     const seen = new Set(M.tokenize(before.filter(Boolean).join(', ')).map(t => t.text.toLowerCase()));
     return M.tokenize(text).filter(t => { const k = t.text.toLowerCase(); if (seen.has(k)) return false; seen.add(k); return true; })
-        .map(t => t.raw || (Math.abs(t.weight - 1) < 0.001 ? t.text : `${M.fmtWeight(t.weight)}::${t.text}::`)).join(', ');
+        .map(t => t.raw ? guardWeightSpacing(t.raw) : (Math.abs(t.weight - 1) < 0.001 ? t.text : formatWeightTag(M.fmtWeight(t.weight), t.text))).join(', ');
 }
 /**
  * 正面 = 正面提示词 + 固定提示词 + 质量词（后两个去掉和前面重复的）
