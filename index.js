@@ -21,7 +21,7 @@ async function startExtension() {
     if (pending) return pending;
     pending = (async () => {
         checkHost();
-        const { createRuntime } = await import('./runtime.js?v=0.8.16');
+        const { createRuntime } = await import('./runtime.js?v=0.8.17');
         if (!enabled) return;
         const candidate = createRuntime();
         try {

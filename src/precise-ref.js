@@ -10,10 +10,8 @@ export const PRECISE_REF_TYPES_V45 = [
 
 export const PRECISE_REF_TYPES_V5 = [
     ['character', '只参考长相'],
-    ['character_outfit', '长相 + 同服装（V5）'],
     ['both', '长相和画风'],
-    ['both_outfit', '长相 + 画风 + 同服装（V5）'],
-    ['outfit', '只参考服装（V5）'],
+    ['outfit', '服装参考（V5）'],
     ['style', '只参考画风'],
 ];
 
@@ -47,18 +45,16 @@ export function directorBaseCaption(type, isV5 = false) {
     switch (type) {
         case 'both':
         case 'character&style':
+        case 'both_outfit':
+        case 'character&style&outfit':
             return 'character&style';
         case 'style':
             return 'style';
         case 'outfit':
             return isV5 ? 'outfit' : 'character';
+        case 'character':
         case 'character_outfit':
         case 'character&outfit':
-            return isV5 ? 'character&outfit' : 'character';
-        case 'both_outfit':
-        case 'character&style&outfit':
-            return isV5 ? 'character&style&outfit' : 'character&style';
-        case 'character':
         default:
             return 'character';
     }

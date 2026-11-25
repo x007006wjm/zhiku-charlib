@@ -20,10 +20,8 @@ const PRECISE_REF_TYPES_V45 = [
 
 const PRECISE_REF_TYPES_V5 = [
     ['character', '只参考长相'],
-    ['character_outfit', '长相 + 同服装（V5）'],
     ['both', '长相和画风'],
-    ['both_outfit', '长相 + 画风 + 同服装（V5）'],
-    ['outfit', '只参考服装（V5）'],
+    ['outfit', '服装参考（V5）'],
     ['style', '只参考画风'],
 ];
 
@@ -57,18 +55,16 @@ function directorBaseCaption(type, isV5 = false) {
     switch (type) {
         case 'both':
         case 'character&style':
+        case 'both_outfit':
+        case 'character&style&outfit':
             return 'character&style';
         case 'style':
             return 'style';
         case 'outfit':
             return isV5 ? 'outfit' : 'character';
+        case 'character':
         case 'character_outfit':
         case 'character&outfit':
-            return isV5 ? 'character&outfit' : 'character';
-        case 'both_outfit':
-        case 'character&style&outfit':
-            return isV5 ? 'character&style&outfit' : 'character&style';
-        case 'character':
         default:
             return 'character';
     }
@@ -182,7 +178,7 @@ function deleteUcpPreset(presets, id) {
     return normalizeUcpPresets(presets).filter(p => p.id !== target);
 }
 
-// 智库 · 原生扩展版 v0.8.16（二改自从前佬的智绘姬）
+// 智库 · 原生扩展版 v0.8.17（二改自从前佬的智绘姬）
 // 不需要智绘姬，填 NovelAI key 就能用。
 // NovelAI 请求格式参考了智绘姬（作者：从前跟你一样，https://github.com/damoshen123/st-chatu8，AFPL v9）。
 const P = (() => { try { if (window.parent && window.parent !== window && window.parent.document) return window.parent; } catch (e) { /* 跨域 */ } return window; })();
@@ -200,7 +196,7 @@ const __shim = {
     get extension_settings() { return __ctx().extensionSettings; },
 };
 
-globalThis.__PC_VERSION = '0.8.16';
+globalThis.__PC_VERSION = '0.8.17';
 
 // ───── model.js ─────
 const __mod_model = (() => {
@@ -5580,7 +5576,7 @@ function viewCharEdit(d) {
         ${g.refs.map((r, i) => `<div class="pc-vrow"><div class="pc-vthumb"><img src="${esc('/' + r.path)}" alt=""></div>
           <div class="pc-grow"><div class="pc-row-between"><select class="pc-mini-select" data-crtype="${g.id}:${i}">${TYPES.map(([v, t]) => `<option value="${v}" ${v === (r.type || 'character') ? 'selected' : ''}>${t}</option>`).join('')}</select><button class="pc-x" data-act="crdel" data-g="${g.id}" data-i="${i}" aria-label="删掉">×</button></div>
           <label class="pc-slider"><span>强度</span><input type="range" min="0" max="${maxStr}" step="${stepStr}" value="${clampDirectorStrength(r.strength ?? 0.6, isV5)}" data-crstr="${g.id}:${i}"><b>${clampDirectorStrength(r.strength ?? 0.6, isV5).toFixed(2)}</b></label></div></div>`).join('') || '<div class="pc-dim small pc-mt-s">这组还没有图，点「＋ 加图」。V5 可同组添加多张图分别设为长相参考和服装参考。</div>'}
-        <div class="pc-hint">${isV5 ? 'NAI 5 支持「只参考服装」「优先同服装」，强度最高可调至 5.0（画风/服装参考不够像时可适当调高到 1.0 以上）。' : '「强度」越大越像参考图，一般 0.5 到 0.8。'}长按组名可以改名或删除。</div>` : ''}`;
+        <div class="pc-hint">${isV5 ? 'NAI 5 支持「服装参考（outfit）」，强度最高可调至 5.0（想同时参考长相和服装，可在同组加两张图分别设为长相和服装）。' : '「强度」越大越像参考图，一般 0.5 到 0.8。'}长按组名可以改名或删除。</div>` : ''}`;
       })()}
     </section>
 

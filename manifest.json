@@ -3,7 +3,7 @@
   "loading_order": 100,
   "js": "index.js",
   "author": "if love",
-  "version": "0.8.16",
+  "version": "0.8.17",
   "homePage": "https://github.com/x007006wjm/zhiku-charlib",
   "auto_update": true,
   "minimum_client_version": "1.14.0",

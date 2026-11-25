@@ -12,13 +12,13 @@ assert.equal(isPreciseRefModel('nai-diffusion-5-curated'), true);
 assert.equal(isPreciseRefModel('nai-diffusion-4-full'), false);
 assert.equal(isPreciseRefModel('nai-diffusion-3'), false);
 
-// 2. base_caption 映射：V5 支持 outfit / character&outfit / character&style&outfit，V4.5 安全回落
+// 2. base_caption 映射：V5 严格使用官方 4 种（character / style / outfit / character&style），旧组合值安全映射
 assert.equal(directorBaseCaption('character', true), 'character');
 assert.equal(directorBaseCaption('both', true), 'character&style');
 assert.equal(directorBaseCaption('style', true), 'style');
 assert.equal(directorBaseCaption('outfit', true), 'outfit');
-assert.equal(directorBaseCaption('character_outfit', true), 'character&outfit');
-assert.equal(directorBaseCaption('both_outfit', true), 'character&style&outfit');
+assert.equal(directorBaseCaption('character_outfit', true), 'character');
+assert.equal(directorBaseCaption('both_outfit', true), 'character&style');
 assert.equal(directorBaseCaption('outfit', false), 'character');
 assert.equal(directorBaseCaption('character_outfit', false), 'character');
 assert.equal(directorBaseCaption('both_outfit', false), 'character&style');
