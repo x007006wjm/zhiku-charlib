@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import {
-    isPreciseRefModel, directorBaseCaption, clampDirectorStrength, buildDirectorParams,
+    isPreciseRefModel, directorBaseCaption, clampDirectorStrength, buildDirectorParams, pickDirectorBucket,
 } from '../src/precise-ref.js';
 
 // 1. 模型支持判定：4.5 与 5 全系支持，V3 / V4 不支持
@@ -46,4 +46,12 @@ assert.deepEqual(v45Params.director_reference_descriptions.map(d => d.caption.ba
 assert.deepEqual(v45Params.director_reference_strength_values, [0.6]);
 assert.deepEqual(v45Params.director_reference_secondary_strength_values, [0.4]);
 
-console.log('PASS: NovelAI V5 & V4.5 Precise Reference (model check, outfit/same-outfit captions, 0..5 strength, V5 fidelity=0).');
+// 6. 分桶尺寸选择：V5 约 1MP 分桶（832×1216 / 1024×1024 / 1216×832），V4.5 保持原分桶
+assert.deepEqual(pickDirectorBucket(1024, 1536, true), [832, 1216]);
+assert.deepEqual(pickDirectorBucket(1472, 1472, true), [1024, 1024]);
+assert.deepEqual(pickDirectorBucket(1536, 1024, true), [1216, 832]);
+assert.deepEqual(pickDirectorBucket(832, 1216, false), [1024, 1536]);
+assert.deepEqual(pickDirectorBucket(1024, 1024, false), [1472, 1472]);
+assert.deepEqual(pickDirectorBucket(1216, 832, false), [1536, 1024]);
+
+console.log('PASS: NovelAI V5 & V4.5 Precise Reference (model check, outfit/same-outfit captions, 0..5 strength, V5 fidelity=0, V5 1MP buckets).');

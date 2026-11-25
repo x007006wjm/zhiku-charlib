@@ -6,7 +6,7 @@ import {applyCharLibrary} from './apply-char-lib.mjs';
 import {fileURLToPath} from 'node:url';
 process.chdir(fileURLToPath(new URL('../', import.meta.url)));
 const dir='.';
-const VERSION='0.8.15';
+const VERSION='0.8.16';
 let s=applyMarkers(JSON.parse(fs.readFileSync('zhiku.script.json','utf8')).content);
 function patch(a,b){assert.equal(s.split(a).length,2,a.slice(0,80));s=s.replace(a,()=>b);}
 patch("globalThis.__PC_VERSION = '0.6.3';", `globalThis.__PC_VERSION = '${VERSION}';`);
@@ -214,6 +214,51 @@ s=applyUxFixes(s);
         Object.assign(p, buildDirectorParams(director, isV5));
         refs = null;
     }`);
+    // 发送参考图前按当前模型分桶自适应缩放（V5: 832x1216 / 1024x1024 / 1216x832；V4.5: 1024x1536 / 1472x1472 / 1536x1024），已有参考图无需重传
+    patch(`async function charRefs(groupIds) {
+    const d = getData();
+    const groups = (groupIds || []).map(id => d.charRefGroups?.[id]).filter(g => g?.refs?.length);
+    if (!groups.length || !N.charRefSupported()) return null;
+    const out = [];
+    for (const r of groups.flatMap(g => g.refs)) {
+        r.cache ||= '';
+        const data = (await urlToDataUrl('/' + r.path.replace(/^\\/+/, ''))).split(',')[1];
+        out.push({ key: crypto.randomUUID?.() || M.uid('k'), data, type: r.type || 'character', strength: Number(r.strength ?? 0.6) });
+    }
+    return out.length ? out : null;
+}`,
+    `const __charRefBucketCache = new Map();
+async function fitDirectorImageB64(dataUrl, isV5) {
+    const img = await new Promise((ok, bad) => { const i = new Image(); i.onload = () => ok(i); i.onerror = () => bad(new Error('参考图打不开')); i.src = dataUrl; });
+    const [w, h] = pickDirectorBucket(img.naturalWidth || img.width, img.naturalHeight || img.height, isV5);
+    if ((img.naturalWidth || img.width) === w && (img.naturalHeight || img.height) === h) return dataUrl.split(',')[1];
+    const c = DOC.createElement('canvas'); c.width = w; c.height = h;
+    const ctx = c.getContext('2d'); ctx.imageSmoothingQuality = 'high';
+    ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, w, h);
+    const k = Math.min(w / img.width, h / img.height), dw = img.width * k, dh = img.height * k;
+    ctx.drawImage(img, (w - dw) / 2, (h - dh) / 2, dw, dh);
+    return c.toDataURL('image/jpeg', 0.92).split(',')[1];
+}
+async function charRefs(groupIds) {
+    const d = getData();
+    const groups = (groupIds || []).map(id => d.charRefGroups?.[id]).filter(g => g?.refs?.length);
+    if (!groups.length || !N.charRefSupported()) return null;
+    const isV5 = String(N.settings().novelaimode || '').includes('nai-diffusion-5');
+    const out = [];
+    for (const r of groups.flatMap(g => g.refs)) {
+        r.cache ||= '';
+        const cacheKey = r.path + '|' + (isV5 ? 'v5' : 'v45');
+        let data = __charRefBucketCache.get(cacheKey);
+        if (!data) {
+            const rawUrl = await urlToDataUrl('/' + r.path.replace(/^\\/+/, ''));
+            data = await fitDirectorImageB64(rawUrl, isV5);
+            if (__charRefBucketCache.size > 32) __charRefBucketCache.clear();
+            __charRefBucketCache.set(cacheKey, data);
+        }
+        out.push({ key: crypto.randomUUID?.() || M.uid('k'), data, type: r.type || 'character', strength: Number(r.strength ?? 0.6) });
+    }
+    return out.length ? out : null;
+}`);
     // 角色详情页：支持 NAI 5 精确参考 + 服装参考 + V5 强度 0~5.0
     patch(`      <b>长相参考</b>
       <div class="pc-dim small">绑一组角色参考图，聊天生图带上\${esc(c.name)}时，就照着这组图画出同一个人。只有 NAI 4.5 能用；用上时那张图不加氛围（NovelAI 不能两个一起用）。</div>

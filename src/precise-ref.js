@@ -17,6 +17,27 @@ export const PRECISE_REF_TYPES_V5 = [
     ['style', '只参考画风'],
 ];
 
+export const DIRECTOR_BUCKETS_V45 = [
+    [1024, 1536],
+    [1472, 1472],
+    [1536, 1024],
+];
+
+// V5 PR 使用官方约 1MP 分桶尺寸（不能沿用 V4.5 的 1024×1536 / 1472×1472 / 1536×1024）
+export const DIRECTOR_BUCKETS_V5 = [
+    [832, 1216],
+    [1024, 1024],
+    [1216, 832],
+];
+
+export function pickDirectorBucket(width, height, isV5 = false) {
+    const buckets = isV5 ? DIRECTOR_BUCKETS_V5 : DIRECTOR_BUCKETS_V45;
+    const w = Number(width), h = Number(height);
+    if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) return buckets[1];
+    const ratio = w / h;
+    return buckets.reduce((a, b) => (Math.abs(b[0] / b[1] - ratio) < Math.abs(a[0] / a[1] - ratio) ? b : a));
+}
+
 export function isPreciseRefModel(model) {
     const m = String(model || '');
     return m.includes('4-5') || m.includes('nai-diffusion-5');

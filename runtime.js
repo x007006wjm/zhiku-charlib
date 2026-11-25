@@ -27,6 +27,27 @@ const PRECISE_REF_TYPES_V5 = [
     ['style', '只参考画风'],
 ];
 
+const DIRECTOR_BUCKETS_V45 = [
+    [1024, 1536],
+    [1472, 1472],
+    [1536, 1024],
+];
+
+// V5 PR 使用官方约 1MP 分桶尺寸（不能沿用 V4.5 的 1024×1536 / 1472×1472 / 1536×1024）
+const DIRECTOR_BUCKETS_V5 = [
+    [832, 1216],
+    [1024, 1024],
+    [1216, 832],
+];
+
+function pickDirectorBucket(width, height, isV5 = false) {
+    const buckets = isV5 ? DIRECTOR_BUCKETS_V5 : DIRECTOR_BUCKETS_V45;
+    const w = Number(width), h = Number(height);
+    if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) return buckets[1];
+    const ratio = w / h;
+    return buckets.reduce((a, b) => (Math.abs(b[0] / b[1] - ratio) < Math.abs(a[0] / a[1] - ratio) ? b : a));
+}
+
 function isPreciseRefModel(model) {
     const m = String(model || '');
     return m.includes('4-5') || m.includes('nai-diffusion-5');
@@ -161,7 +182,7 @@ function deleteUcpPreset(presets, id) {
     return normalizeUcpPresets(presets).filter(p => p.id !== target);
 }
 
-// 智库 · 原生扩展版 v0.8.15（二改自从前佬的智绘姬）
+// 智库 · 原生扩展版 v0.8.16（二改自从前佬的智绘姬）
 // 不需要智绘姬，填 NovelAI key 就能用。
 // NovelAI 请求格式参考了智绘姬（作者：从前跟你一样，https://github.com/damoshen123/st-chatu8，AFPL v9）。
 const P = (() => { try { if (window.parent && window.parent !== window && window.parent.document) return window.parent; } catch (e) { /* 跨域 */ } return window; })();
@@ -179,7 +200,7 @@ const __shim = {
     get extension_settings() { return __ctx().extensionSettings; },
 };
 
-globalThis.__PC_VERSION = '0.8.15';
+globalThis.__PC_VERSION = '0.8.16';
 
 // ───── model.js ─────
 const __mod_model = (() => {
@@ -1448,14 +1469,34 @@ async function vibeRefs() {
 
 /** 当前角色参考组 → 请求里的数据 */
 /** groupIds：角色页里给出场角色绑定的组；不给就不用角色参考 */
+const __charRefBucketCache = new Map();
+async function fitDirectorImageB64(dataUrl, isV5) {
+    const img = await new Promise((ok, bad) => { const i = new Image(); i.onload = () => ok(i); i.onerror = () => bad(new Error('参考图打不开')); i.src = dataUrl; });
+    const [w, h] = pickDirectorBucket(img.naturalWidth || img.width, img.naturalHeight || img.height, isV5);
+    if ((img.naturalWidth || img.width) === w && (img.naturalHeight || img.height) === h) return dataUrl.split(',')[1];
+    const c = DOC.createElement('canvas'); c.width = w; c.height = h;
+    const ctx = c.getContext('2d'); ctx.imageSmoothingQuality = 'high';
+    ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, w, h);
+    const k = Math.min(w / img.width, h / img.height), dw = img.width * k, dh = img.height * k;
+    ctx.drawImage(img, (w - dw) / 2, (h - dh) / 2, dw, dh);
+    return c.toDataURL('image/jpeg', 0.92).split(',')[1];
+}
 async function charRefs(groupIds) {
     const d = getData();
     const groups = (groupIds || []).map(id => d.charRefGroups?.[id]).filter(g => g?.refs?.length);
     if (!groups.length || !N.charRefSupported()) return null;
+    const isV5 = String(N.settings().novelaimode || '').includes('nai-diffusion-5');
     const out = [];
     for (const r of groups.flatMap(g => g.refs)) {
         r.cache ||= '';
-        const data = (await urlToDataUrl('/' + r.path.replace(/^\/+/, ''))).split(',')[1];
+        const cacheKey = r.path + '|' + (isV5 ? 'v5' : 'v45');
+        let data = __charRefBucketCache.get(cacheKey);
+        if (!data) {
+            const rawUrl = await urlToDataUrl('/' + r.path.replace(/^\/+/, ''));
+            data = await fitDirectorImageB64(rawUrl, isV5);
+            if (__charRefBucketCache.size > 32) __charRefBucketCache.clear();
+            __charRefBucketCache.set(cacheKey, data);
+        }
         out.push({ key: crypto.randomUUID?.() || M.uid('k'), data, type: r.type || 'character', strength: Number(r.strength ?? 0.6) });
     }
     return out.length ? out : null;
