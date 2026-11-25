@@ -8,6 +8,76 @@ function setTimeout(fn, delay, ...args) {
     timers.add(id); return id;
 }
 function clearTimeout(id) { window.clearTimeout(id); timers.delete(id); }
+// NovelAI Precise Reference (V4.5 & V5) 参数构造与类型映射。
+// V5 (2026-11-24) 正式支持精确参考，新增「服装参考（outfit）」与「优先同服装」，
+// 废除忠实度滑条（secondary_strength 固定为 0），强度上限提升至 5.0。
+
+const PRECISE_REF_TYPES_V45 = [
+    ['character', '只参考长相'],
+    ['both', '长相和画风'],
+    ['style', '只参考画风'],
+];
+
+const PRECISE_REF_TYPES_V5 = [
+    ['character', '只参考长相'],
+    ['character_outfit', '长相 + 同服装（V5）'],
+    ['both', '长相和画风'],
+    ['both_outfit', '长相 + 画风 + 同服装（V5）'],
+    ['outfit', '只参考服装（V5）'],
+    ['style', '只参考画风'],
+];
+
+function isPreciseRefModel(model) {
+    const m = String(model || '');
+    return m.includes('4-5') || m.includes('nai-diffusion-5');
+}
+
+function directorBaseCaption(type, isV5 = false) {
+    switch (type) {
+        case 'both':
+        case 'character&style':
+            return 'character&style';
+        case 'style':
+            return 'style';
+        case 'outfit':
+            return isV5 ? 'outfit' : 'character';
+        case 'character_outfit':
+        case 'character&outfit':
+            return isV5 ? 'character&outfit' : 'character';
+        case 'both_outfit':
+        case 'character&style&outfit':
+            return isV5 ? 'character&style&outfit' : 'character&style';
+        case 'character':
+        default:
+            return 'character';
+    }
+}
+
+function clampDirectorStrength(value, isV5 = false) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return 0.6;
+    const max = isV5 ? 5 : 1;
+    return Math.round(Math.min(max, Math.max(0, n)) * 1000) / 1000;
+}
+
+function buildDirectorParams(director, isV5 = false) {
+    const list = Array.isArray(director) ? director : [];
+    const strengths = list.map(r => clampDirectorStrength(r.strength, isV5));
+    return {
+        director_reference_images_cached: list.map(r => ({ cache_secret_key: r.key, data: r.data })),
+        director_reference_descriptions: list.map(r => ({
+            caption: { base_caption: directorBaseCaption(r.type, isV5), char_captions: [] },
+            legacy_uc: false,
+        })),
+        director_reference_information_extracted: list.map(() => 1),
+        director_reference_strength_values: strengths,
+        // V5 废除了忠实度（Fidelity），统一填 0；V4.5 保持原有 1 - strength 计算
+        director_reference_secondary_strength_values: isV5
+            ? list.map(() => 0)
+            : strengths.map(v => Math.round((1 - v) * 1000) / 1000),
+    };
+}
+
 // NovelAI 数值权重语法防护：
 // 当权重块 `w::内容::` 的内容以数字（或 . : -）结尾时（如 `0.5::artist:bm94199::`、`1.2::year 2024::`），
 // 若 `::` 前没有空格，NovelAI 解析器会把末尾数字与 `::` 误判为嵌套权重导致权重爆炸。
@@ -91,7 +161,7 @@ function deleteUcpPreset(presets, id) {
     return normalizeUcpPresets(presets).filter(p => p.id !== target);
 }
 
-// 智库 · 原生扩展版 v0.8.14（二改自从前佬的智绘姬）
+// 智库 · 原生扩展版 v0.8.15（二改自从前佬的智绘姬）
 // 不需要智绘姬，填 NovelAI key 就能用。
 // NovelAI 请求格式参考了智绘姬（作者：从前跟你一样，https://github.com/damoshen123/st-chatu8，AFPL v9）。
 const P = (() => { try { if (window.parent && window.parent !== window && window.parent.document) return window.parent; } catch (e) { /* 跨域 */ } return window; })();
@@ -109,7 +179,7 @@ const __shim = {
     get extension_settings() { return __ctx().extensionSettings; },
 };
 
-globalThis.__PC_VERSION = '0.8.14';
+globalThis.__PC_VERSION = '0.8.15';
 
 // ───── model.js ─────
 const __mod_model = (() => {
@@ -955,13 +1025,9 @@ function buildParameters({ positive, negative, width, height, seed, chars = [], 
         if (!p.reference_image_multiple_cached?.length) delete p.reference_image_multiple_cached;
     }
     if (p.sampler === 'k_euler_ancestral') { p.deliberate_euler_ancestral_bug = false; p.prefer_brownian = true; }
-    if (director?.length && model.includes('4-5')) {
-        // 角色参考（只有 4.5 能用，而且不能和氛围一起用）
-        p.director_reference_images_cached = director.map(r => ({ cache_secret_key: r.key, data: r.data }));
-        p.director_reference_descriptions = director.map(r => ({ caption: { base_caption: r.type === 'both' ? 'character&style' : r.type === 'style' ? 'style' : 'character', char_captions: [] }, legacy_uc: false }));
-        p.director_reference_information_extracted = director.map(() => 1);
-        p.director_reference_strength_values = director.map(r => r.strength);
-        p.director_reference_secondary_strength_values = director.map(r => Math.round((1 - r.strength) * 1000) / 1000);
+    if (director?.length && isPreciseRefModel(model)) {
+        // 精确参考（NAI 4.5 与 NAI 5 可用；V5 支持服装参考与 0~5 强度且无忠实度滑条）
+        Object.assign(p, buildDirectorParams(director, isV5));
         refs = null;
     }
     if (refs?.images?.length) {
@@ -1246,7 +1312,7 @@ function parseVibeFile(json) {
 
 function charRefSupported() {
     const s = settings();
-    return s.naiMode !== 'tavern' && s.novelaimode.includes('4-5');
+    return s.naiMode !== 'tavern' && isPreciseRefModel(s.novelaimode);
 }
 
 // ───────────── 局部重绘 ─────────────
@@ -5459,19 +5525,21 @@ function viewCharEdit(d) {
     </section>
 
     <section class="pc-card pc-pad pc-mt">
-      <b>长相参考</b>
-      <div class="pc-dim small">绑一组角色参考图，聊天生图带上${esc(c.name)}时，就照着这组图画出同一个人。只有 NAI 4.5 能用；用上时那张图不加氛围（NovelAI 不能两个一起用）。</div>
-      ${!N.charRefSupported() ? '<div class="pc-warn pc-mt-s">现在用不了：要选 NAI 4.5 模型，而且不能是「用酒馆里的 key」。</div>' : ''}
+      <b>精确参考（长相 / 服装 / 画风）</b>
+      <div class="pc-dim small">绑一组参考图，聊天生图带上${esc(c.name)}时照着画（可同组混搭长相图 + 服装图）。支持 NAI 4.5 和 NAI 5；用上时那张图不加氛围。</div>
+      ${!N.charRefSupported() ? '<div class="pc-warn pc-mt-s">现在用不了：要选 NAI 4.5 或 NAI 5 模型，而且不能是「用酒馆里的 key」。</div>' : ''}
       ${(() => {
         const g = c.charRef && d.charRefGroups?.[c.charRef];
-        const TYPES = [['character', '只参考长相'], ['both', '长相和画风'], ['style', '只参考画风']];
+        const isV5 = String(N.settings().novelaimode || '').includes('nai-diffusion-5');
+        const TYPES = isV5 ? PRECISE_REF_TYPES_V5 : PRECISE_REF_TYPES_V45;
+        const maxStr = isV5 ? 5 : 1, stepStr = isV5 ? 0.05 : 0.01;
         return `<div class="pc-chips wrap"><button class="pc-pill ${!g ? 'on' : 'dashed'}" data-act="charrefpick" data-id="">不用</button>${Object.values(d.charRefGroups || {}).map(x => `<button class="pc-pill ${g && g.id === x.id ? 'on' : 'dashed'}" data-act="charrefpick" data-id="${x.id}" data-lp="crgroup">${esc(x.name)}</button>`).join('')}
         <label class="pc-pill dashed">＋ 新的一组<input type="file" accept="image/*" data-charrefup hidden></label></div>
         ${g ? `<div class="pc-row-between pc-mt-s"><span class="pc-dim small">「${esc(g.name)}」· ${g.refs.length} 张</span><label class="pc-pill dashed tiny">＋ 加图<input type="file" accept="image/*" multiple data-cradd="${g.id}" hidden></label></div>
         ${g.refs.map((r, i) => `<div class="pc-vrow"><div class="pc-vthumb"><img src="${esc('/' + r.path)}" alt=""></div>
           <div class="pc-grow"><div class="pc-row-between"><select class="pc-mini-select" data-crtype="${g.id}:${i}">${TYPES.map(([v, t]) => `<option value="${v}" ${v === (r.type || 'character') ? 'selected' : ''}>${t}</option>`).join('')}</select><button class="pc-x" data-act="crdel" data-g="${g.id}" data-i="${i}" aria-label="删掉">×</button></div>
-          <label class="pc-slider"><span>像不像</span><input type="range" min="0" max="1" step="0.01" value="${Number(r.strength ?? 0.6)}" data-crstr="${g.id}:${i}"><b>${Number(r.strength ?? 0.6).toFixed(2)}</b></label></div></div>`).join('') || '<div class="pc-dim small pc-mt-s">这组还没有图，点「＋ 加图」。最好是单人、看得清脸和衣服。</div>'}
-        <div class="pc-hint">「像不像」越大越像参考图，太大会不听提示词，一般 0.5 到 0.8。长按组名可以改名或删除。</div>` : ''}`;
+          <label class="pc-slider"><span>强度</span><input type="range" min="0" max="${maxStr}" step="${stepStr}" value="${clampDirectorStrength(r.strength ?? 0.6, isV5)}" data-crstr="${g.id}:${i}"><b>${clampDirectorStrength(r.strength ?? 0.6, isV5).toFixed(2)}</b></label></div></div>`).join('') || '<div class="pc-dim small pc-mt-s">这组还没有图，点「＋ 加图」。V5 可同组添加多张图分别设为长相参考和服装参考。</div>'}
+        <div class="pc-hint">${isV5 ? 'NAI 5 支持「只参考服装」「优先同服装」，强度最高可调至 5.0（画风/服装参考不够像时可适当调高到 1.0 以上）。' : '「强度」越大越像参考图，一般 0.5 到 0.8。'}长按组名可以改名或删除。</div>` : ''}`;
       })()}
     </section>
 
@@ -5877,7 +5945,9 @@ function viewCharRef(d) {
     const groups = Object.values(d.charRefGroups || {});
     const cur = d.charRefGroups?.[d.charRefActive];
     const show = d.charRefGroups?.[ui.crShow] || cur || groups[0];
-    const TYPES = [['character', '只参考长相'], ['both', '长相和画风'], ['style', '只参考画风']];
+    const isV5 = String(N.settings().novelaimode || '').includes('nai-diffusion-5');
+    const TYPES = isV5 ? PRECISE_REF_TYPES_V5 : PRECISE_REF_TYPES_V45;
+    const maxStr = isV5 ? 5 : 1, stepStr = isV5 ? 0.05 : 0.01;
     const card = g => `<article class="pc-ticket ${g.id === d.charRefActive ? 'active' : ''}" data-act="crshow" data-id="${g.id}" data-lp="crgroup">
         <div class="pc-ticket-img">${g.refs[0] ? `<img src="${esc('/' + g.refs[0].path)}" alt="" loading="lazy">` : '<span>还没有图</span>'}</div>
         <button class="pc-use ${g.id === d.charRefActive ? 'on' : ''}" data-act="cruse" data-id="${g.id}" aria-label="用这组">${g.id === d.charRefActive ? SYM.check : SYM.swap}</button>
@@ -5885,10 +5955,10 @@ function viewCharRef(d) {
     return `${vibeTabs()}
     <section class="pc-card pc-pad pc-row-between pc-mt">
       <div class="pc-grow"><b class="pc-big">正在用：${cur ? esc(cur.name) : '不用角色参考'}</b>
-        <div class="pc-dim small">给一张角色图，让 NovelAI 照着画出同一个人。只有 NAI 4.5 能用；开着时氛围会暂停。</div></div>
+        <div class="pc-dim small">给参考图，让 NovelAI 照着画出同一个人或服装。支持 NAI 4.5 和 NAI 5；开着时氛围会暂停。</div></div>
       <button class="pc-add" data-act="crnew" aria-label="新建角色参考组">＋</button>
     </section>
-    ${!N.charRefSupported() ? '<div class="pc-card pc-pad pc-mt pc-warn-card">现在用不了：要选 NAI 4.5 模型，而且不能是「用酒馆里的 key」。</div>' : ''}
+    ${!N.charRefSupported() ? '<div class="pc-card pc-pad pc-mt pc-warn-card">现在用不了：要选 NAI 4.5 或 NAI 5 模型，而且不能是「用酒馆里的 key」。</div>' : ''}
     <div class="pc-grid2 pc-mt">${groups.map(card).join('')}
       <article class="pc-ticket ${!cur ? 'active' : ''}" data-act="cruse" data-id="">
         <div class="pc-ticket-img"><span>不加参考</span></div>
@@ -5901,7 +5971,7 @@ function viewCharRef(d) {
       ${show.refs.map((r, i) => `<div class="pc-vrow">
         <div class="pc-vthumb"><img src="${esc('/' + r.path)}" alt=""></div>
         <div class="pc-grow"><div class="pc-row-between"><select class="pc-mini-select" data-crtype="${show.id}:${i}">${TYPES.map(([v, t]) => `<option value="${v}" ${v === (r.type || 'character') ? 'selected' : ''}>${t}</option>`).join('')}</select><button class="pc-x" data-act="crdel" data-g="${show.id}" data-i="${i}" aria-label="删掉">×</button></div>
-          <label class="pc-slider"><span>像不像</span><input type="range" min="0" max="1" step="0.01" value="${Number(r.strength ?? 0.6)}" data-crstr="${show.id}:${i}"><b>${Number(r.strength ?? 0.6).toFixed(2)}</b></label></div></div>`).join('') || '<div class="pc-dim small pc-mt-s">点「＋ 加图」放一张角色图，最好是单人、看得清脸和衣服。</div>'}
+          <label class="pc-slider"><span>强度</span><input type="range" min="0" max="${maxStr}" step="${stepStr}" value="${clampDirectorStrength(r.strength ?? 0.6, isV5)}" data-crstr="${show.id}:${i}"><b>${clampDirectorStrength(r.strength ?? 0.6, isV5).toFixed(2)}</b></label></div></div>`).join('') || '<div class="pc-dim small pc-mt-s">点「＋ 加图」放一张角色图，最好是单人、看得清脸和衣服。</div>'}
       <div class="pc-hint">「像不像」越大越像参考图，太大会不听提示词。一般 0.5 到 0.8。</div>
     </section>` : ''}
     <div style="height:24px"></div>`;
