@@ -6,7 +6,7 @@ import {applyCharLibrary} from './apply-char-lib.mjs';
 import {fileURLToPath} from 'node:url';
 process.chdir(fileURLToPath(new URL('../', import.meta.url)));
 const dir='.';
-const VERSION='0.8.19';
+const VERSION='0.8.20';
 let s=applyMarkers(JSON.parse(fs.readFileSync('zhiku.script.json','utf8')).content);
 function patch(a,b){assert.equal(s.split(a).length,2,a.slice(0,80));s=s.replace(a,()=>b);}
 patch("globalThis.__PC_VERSION = '0.6.3';", `globalThis.__PC_VERSION = '${VERSION}';`);
@@ -221,7 +221,13 @@ s=applyUxFixes(s);
         }
         const key = String(s.naiKey || '').trim();
         if (!key) return { ok: false, note: '未填 NovelAI key' };
-        const r = await http('https://api.novelai.net/user/subscription', { headers: { Authorization: 'Bearer ' + key } });
+        let r;
+        try {
+            r = await http('https://image.novelai.net/user/subscription', { headers: { Authorization: 'Bearer ' + key } });
+            if (!r.ok && r.status !== 401) r = await http('https://api.novelai.net/user/subscription', { headers: { Authorization: 'Bearer ' + key } });
+        } catch {
+            r = await http('https://api.novelai.net/user/subscription', { headers: { Authorization: 'Bearer ' + key } });
+        }
         if (r.status === 401) return { ok: false, note: 'key 不对' };
         if (!r.ok) return { ok: false, note: \`查询失败 (\${r.status})\` };
         const parsed = parseQuotaResponse(await r.json().catch(() => null));
@@ -255,7 +261,7 @@ async function refreshQuota(force = false) {
     uiQuota.state = 'loading'; uiQuota.note = ''; syncQuotaBadge();
     const res = await N.fetchQuota();
     if (res.ok) {
-        uiQuota.state = 'ok'; uiQuota.label = res.label; uiQuota.note = ''; uiQuota.at = Date.now();
+        uiQuota.state = 'ok'; uiQuota.label = res.label; uiQuota.note = res.detail || ''; uiQuota.at = Date.now();
     } else {
         uiQuota.state = 'err'; uiQuota.label = ''; uiQuota.note = res.note || '查询失败';
     }
