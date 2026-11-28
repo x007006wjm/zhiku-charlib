@@ -8,6 +8,55 @@ function setTimeout(fn, delay, ...args) {
     timers.add(id); return id;
 }
 function clearTimeout(id) { window.clearTimeout(id); timers.delete(id); }
+// 剩余额度（Anlas / 中转站点数）URL 推导与响应解析。
+// 支持 NovelAI 官方 /user/subscription、酒馆 /api/novelai/status，以及常见第三方中转站余额字段。
+
+/** 从第三方站点地址推导 /user/subscription 查询地址。 */
+function quotaUrlForSite(siteUrl) {
+    const raw = String(siteUrl || '').trim().replace(/\/+$/, '');
+    if (!raw) return '';
+    // 去掉常见的生图路径后缀，得到站点根路径
+    const base = raw
+        .replace(/\/ai\/generate-image(?:-stream)?$/i, '')
+        .replace(/\/generate-image$/i, '')
+        .replace(/\/user\/subscription$/i, '');
+    return base + '/user/subscription';
+}
+
+function finiteNumber(v) {
+    if (typeof v === 'number' && Number.isFinite(v)) return v;
+    if (typeof v === 'string' && v.trim() !== '') {
+        const n = Number(v.trim());
+        if (Number.isFinite(n)) return n;
+    }
+    return null;
+}
+
+/** 从接口 JSON 中解析剩余额度，返回 { amount, label } 或 null。 */
+function parseQuotaResponse(json) {
+    if (!json || typeof json !== 'object') return null;
+    const t = json.trainingStepsLeft || json.subscription?.trainingStepsLeft || json.data?.trainingStepsLeft;
+    if (t && typeof t === 'object') {
+        const fixed = finiteNumber(t.fixedTrainingStepsLeft) ?? 0;
+        const purchased = finiteNumber(t.purchasedTrainingSteps) ?? 0;
+        const total = fixed + purchased;
+        return { amount: total, label: `剩 ${Math.round(total).toLocaleString()} 点` };
+    }
+    const candidates = [
+        json.anlas, json.balance, json.quota, json.remaining, json.credits, json.points,
+        json.data?.anlas, json.data?.balance, json.data?.quota, json.data?.remaining, json.data?.credits, json.data?.points,
+        json.user?.balance, json.user?.quota, json.user?.credits,
+    ];
+    for (const c of candidates) {
+        const n = finiteNumber(c);
+        if (n !== null) {
+            const text = Number.isInteger(n) ? n.toLocaleString() : n.toFixed(2).replace(/\.?0+$/, '');
+            return { amount: n, label: `剩 ${text} 点` };
+        }
+    }
+    return null;
+}
+
 // NovelAI Precise Reference (V4.5 & V5) 参数构造与类型映射。
 // V5 (2026-11-24) 正式支持精确参考，新增「服装参考（outfit）」与「优先同服装」，
 // 废除忠实度滑条（secondary_strength 固定为 0），强度上限提升至 5.0。
@@ -178,7 +227,7 @@ function deleteUcpPreset(presets, id) {
     return normalizeUcpPresets(presets).filter(p => p.id !== target);
 }
 
-// 智库 · 原生扩展版 v0.8.18（二改自从前佬的智绘姬）
+// 智库 · 原生扩展版 v0.8.19（二改自从前佬的智绘姬）
 // 不需要智绘姬，填 NovelAI key 就能用。
 // NovelAI 请求格式参考了智绘姬（作者：从前跟你一样，https://github.com/damoshen123/st-chatu8，AFPL v9）。
 const P = (() => { try { if (window.parent && window.parent !== window && window.parent.document) return window.parent; } catch (e) { /* 跨域 */ } return window; })();
@@ -196,7 +245,7 @@ const __shim = {
     get extension_settings() { return __ctx().extensionSettings; },
 };
 
-globalThis.__PC_VERSION = '0.8.18';
+globalThis.__PC_VERSION = '0.8.19';
 
 // ───── model.js ─────
 const __mod_model = (() => {
@@ -1239,6 +1288,35 @@ async function testConnection() {
         return { ok: false, text: '连不上：' + (e?.message || e) };
     }
 }
+async function fetchQuota() {
+    const s = settings();
+    try {
+        if (s.naiMode === 'tavern') {
+            const r = await http('/api/novelai/status', { method: 'POST', headers: getRequestHeaders(), body: '{}' });
+            if (!r.ok) return { ok: false, note: `查询失败 (${r.status})` };
+            const parsed = parseQuotaResponse(await r.json().catch(() => null));
+            return parsed ? { ok: true, ...parsed } : { ok: false, note: '未返回点数' };
+        }
+        if (s.naiMode === 'site') {
+            const url = quotaUrlForSite(s.naiSite);
+            if (!url) return { ok: false, note: '未填站点地址' };
+            const key = String(s.naiSiteKey || '').trim();
+            const r = await http(url, { headers: key ? { Authorization: 'Bearer ' + key } : {} });
+            if (!r.ok) return { ok: false, note: `站点不支持查余额 (${r.status})` };
+            const parsed = parseQuotaResponse(await r.json().catch(() => null));
+            return parsed ? { ok: true, ...parsed } : { ok: false, note: '站点未返回可识别余额' };
+        }
+        const key = String(s.naiKey || '').trim();
+        if (!key) return { ok: false, note: '未填 NovelAI key' };
+        const r = await http('https://api.novelai.net/user/subscription', { headers: { Authorization: 'Bearer ' + key } });
+        if (r.status === 401) return { ok: false, note: 'key 不对' };
+        if (!r.ok) return { ok: false, note: `查询失败 (${r.status})` };
+        const parsed = parseQuotaResponse(await r.json().catch(() => null));
+        return parsed ? { ok: true, ...parsed } : { ok: false, note: '未返回点数' };
+    } catch (e) {
+        return { ok: false, note: '无法连接余额接口' };
+    }
+}
 function anlasText(j) {
     const t = j?.trainingStepsLeft || j?.subscription?.trainingStepsLeft;
     if (!t) return '';
@@ -1378,7 +1456,7 @@ async function inpaintRequest({ image, mask, prompt, negative, width, height, st
     return imageFromResponse(buf);
 }
 
-return { stopQueue:()=>__naiGate.stop(), MODELS, SAMPLERS, SCHEDULES, settings, save, isReady, ucpValue, buildParameters, generate, unzipFirstImage, testConnection, importFromZhihuiji, encKey, vibeSupported, encodeVibe, parseVibeFile, charRefSupported, inpaintModel, inpaint };
+return { stopQueue:()=>__naiGate.stop(), MODELS, SAMPLERS, SCHEDULES, settings, save, isReady, ucpValue, buildParameters, generate, unzipFirstImage, testConnection, fetchQuota, importFromZhihuiji, encKey, vibeSupported, encodeVibe, parseVibeFile, charRefSupported, inpaintModel, inpaint };
 })();
 
 // ───── engine.js ─────
@@ -4426,6 +4504,7 @@ function openWindow(view) {
     root.classList.add('open');
     DOC.body.classList.add('pc-lock');
     render();
+    void refreshQuota(false);
     if (ui.view === 'lobby' && !ui.lobby.items.length) loadLobby();
 }
 function closeWindow() {
@@ -4433,6 +4512,32 @@ function closeWindow() {
     DOC.body.classList.remove('pc-lock');
 }
 
+const uiQuota = { state: 'idle', label: '', note: '', at: 0 };
+function quotaBadgeText() {
+    if (!N.isReady()) return '未配置 Key';
+    if (uiQuota.state === 'loading') return '额度查询中…';
+    if (uiQuota.state === 'ok' && uiQuota.label) return uiQuota.label + ' ↻';
+    return '查额度 ↻';
+}
+function syncQuotaBadge() {
+    const el = root?.querySelector('#pc-quota-badge');
+    if (!el) return;
+    el.textContent = quotaBadgeText();
+    el.title = uiQuota.note ? `${uiQuota.note}（点击重试）` : '点击刷新剩余额度';
+}
+async function refreshQuota(force = false) {
+    if (!N.isReady()) { uiQuota.state = 'idle'; uiQuota.label = ''; uiQuota.note = '请先在设置中填写 Key'; syncQuotaBadge(); return; }
+    if (!force && uiQuota.state === 'ok' && Date.now() - uiQuota.at < 30000) { syncQuotaBadge(); return; }
+    if (uiQuota.state === 'loading') return;
+    uiQuota.state = 'loading'; uiQuota.note = ''; syncQuotaBadge();
+    const res = await N.fetchQuota();
+    if (res.ok) {
+        uiQuota.state = 'ok'; uiQuota.label = res.label; uiQuota.note = ''; uiQuota.at = Date.now();
+    } else {
+        uiQuota.state = 'err'; uiQuota.label = ''; uiQuota.note = res.note || '查询失败';
+    }
+    syncQuotaBadge();
+}
 function render() {
     if (!root) return;
     const d = getData();
@@ -4446,7 +4551,7 @@ function render() {
         <div class="pc-head-card">
           <div>
             <div class="pc-title">智库</div>
-            <div class="pc-subtitle">二改自从前佬的智绘姬</div>
+            <button type="button" id="pc-quota-badge" data-act="refreshquota" title="${esc(uiQuota.note ? uiQuota.note + '（点击重试）' : '点击刷新剩余额度')}" style="margin-top:2px;padding:1px 7px;border-radius:999px;border:1px solid var(--pc-dash,rgba(128,128,128,.35));background:transparent;color:var(--pc-ink-soft,inherit);font-size:11px;line-height:1.5;cursor:pointer">${esc(quotaBadgeText())}</button>
           </div>
           <button class="pc-head-ticket" title="正文生图用的画师串，点一下切换" data-act="switcher">
             <small class="pc-head-lab">正文画师串${d.oneShot ? ' · 只用一次' : ''}</small>
@@ -6482,6 +6587,7 @@ async function onClick(ev, outside = false) {
                 render();
                 break;
             }
+            case 'refreshquota': void refreshQuota(true); break;
             case 'clearresult': ui.studio.result = null; ui.studio.sent = null; render(); break;
             case 'ucp-saveas': {
                 const ns = N.settings();

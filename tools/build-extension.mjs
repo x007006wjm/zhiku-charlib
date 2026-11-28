@@ -6,7 +6,7 @@ import {applyCharLibrary} from './apply-char-lib.mjs';
 import {fileURLToPath} from 'node:url';
 process.chdir(fileURLToPath(new URL('../', import.meta.url)));
 const dir='.';
-const VERSION='0.8.18';
+const VERSION='0.8.19';
 let s=applyMarkers(JSON.parse(fs.readFileSync('zhiku.script.json','utf8')).content);
 function patch(a,b){assert.equal(s.split(a).length,2,a.slice(0,80));s=s.replace(a,()=>b);}
 patch("globalThis.__PC_VERSION = '0.6.3';", `globalThis.__PC_VERSION = '${VERSION}';`);
@@ -197,7 +197,82 @@ s=applyUxFixes(s);
     const ucpHelper = fs.readFileSync('src/ucp-presets.js', 'utf8').replace(/^export\s+/gm, '');
     const weightHelper = fs.readFileSync('src/weight-guard.js', 'utf8').replace(/^export\s+/gm, '');
     const prHelper = fs.readFileSync('src/precise-ref.js', 'utf8').replace(/^export\s+/gm, '');
-    s = prHelper + '\n' + weightHelper + '\n' + ucpHelper + '\n' + s;
+    const quotaHelper = fs.readFileSync('src/quota.js', 'utf8').replace(/^export\s+/gm, '');
+    s = quotaHelper + '\n' + prHelper + '\n' + weightHelper + '\n' + ucpHelper + '\n' + s;
+    // 面板顶部剩余额度查询（官方 key / 酒馆 key / 第三方中转站通用）
+    patch(`function anlasText(j) {`,
+        `async function fetchQuota() {
+    const s = settings();
+    try {
+        if (s.naiMode === 'tavern') {
+            const r = await http('/api/novelai/status', { method: 'POST', headers: getRequestHeaders(), body: '{}' });
+            if (!r.ok) return { ok: false, note: \`查询失败 (\${r.status})\` };
+            const parsed = parseQuotaResponse(await r.json().catch(() => null));
+            return parsed ? { ok: true, ...parsed } : { ok: false, note: '未返回点数' };
+        }
+        if (s.naiMode === 'site') {
+            const url = quotaUrlForSite(s.naiSite);
+            if (!url) return { ok: false, note: '未填站点地址' };
+            const key = String(s.naiSiteKey || '').trim();
+            const r = await http(url, { headers: key ? { Authorization: 'Bearer ' + key } : {} });
+            if (!r.ok) return { ok: false, note: \`站点不支持查余额 (\${r.status})\` };
+            const parsed = parseQuotaResponse(await r.json().catch(() => null));
+            return parsed ? { ok: true, ...parsed } : { ok: false, note: '站点未返回可识别余额' };
+        }
+        const key = String(s.naiKey || '').trim();
+        if (!key) return { ok: false, note: '未填 NovelAI key' };
+        const r = await http('https://api.novelai.net/user/subscription', { headers: { Authorization: 'Bearer ' + key } });
+        if (r.status === 401) return { ok: false, note: 'key 不对' };
+        if (!r.ok) return { ok: false, note: \`查询失败 (\${r.status})\` };
+        const parsed = parseQuotaResponse(await r.json().catch(() => null));
+        return parsed ? { ok: true, ...parsed } : { ok: false, note: '未返回点数' };
+    } catch (e) {
+        return { ok: false, note: '无法连接余额接口' };
+    }
+}
+function anlasText(j) {`);
+    patch(`testConnection, importFromZhihuiji,`, `testConnection, fetchQuota, importFromZhihuiji,`);
+    patch(`    render();\n    if (ui.view === 'lobby' && !ui.lobby.items.length) loadLobby();`,
+        `    render();\n    void refreshQuota(false);\n    if (ui.view === 'lobby' && !ui.lobby.items.length) loadLobby();`);
+    patch(`function render() {`,
+        `const uiQuota = { state: 'idle', label: '', note: '', at: 0 };
+function quotaBadgeText() {
+    if (!N.isReady()) return '未配置 Key';
+    if (uiQuota.state === 'loading') return '额度查询中…';
+    if (uiQuota.state === 'ok' && uiQuota.label) return uiQuota.label + ' ↻';
+    return '查额度 ↻';
+}
+function syncQuotaBadge() {
+    const el = root?.querySelector('#pc-quota-badge');
+    if (!el) return;
+    el.textContent = quotaBadgeText();
+    el.title = uiQuota.note ? \`\${uiQuota.note}（点击重试）\` : '点击刷新剩余额度';
+}
+async function refreshQuota(force = false) {
+    if (!N.isReady()) { uiQuota.state = 'idle'; uiQuota.label = ''; uiQuota.note = '请先在设置中填写 Key'; syncQuotaBadge(); return; }
+    if (!force && uiQuota.state === 'ok' && Date.now() - uiQuota.at < 30000) { syncQuotaBadge(); return; }
+    if (uiQuota.state === 'loading') return;
+    uiQuota.state = 'loading'; uiQuota.note = ''; syncQuotaBadge();
+    const res = await N.fetchQuota();
+    if (res.ok) {
+        uiQuota.state = 'ok'; uiQuota.label = res.label; uiQuota.note = ''; uiQuota.at = Date.now();
+    } else {
+        uiQuota.state = 'err'; uiQuota.label = ''; uiQuota.note = res.note || '查询失败';
+    }
+    syncQuotaBadge();
+}
+function render() {`);
+    patch(`          <div>
+            <div class="pc-title">智库</div>
+            <div class="pc-subtitle">二改自从前佬的智绘姬</div>
+          </div>`,
+        `          <div>
+            <div class="pc-title">智库</div>
+            <button type="button" id="pc-quota-badge" data-act="refreshquota" title="\${esc(uiQuota.note ? uiQuota.note + '（点击重试）' : '点击刷新剩余额度')}" style="margin-top:2px;padding:1px 7px;border-radius:999px;border:1px solid var(--pc-dash,rgba(128,128,128,.35));background:transparent;color:var(--pc-ink-soft,inherit);font-size:11px;line-height:1.5;cursor:pointer">\${esc(quotaBadgeText())}</button>
+          </div>`);
+    patch(`            case 'clearresult':`,
+        `            case 'refreshquota': void refreshQuota(true); break;
+            case 'clearresult':`);
     patch("function charRefSupported() {\n    const s = settings();\n    return s.naiMode !== 'tavern' && s.novelaimode.includes('4-5');\n}",
         "function charRefSupported() {\n    const s = settings();\n    return s.naiMode !== 'tavern' && isPreciseRefModel(s.novelaimode);\n}");
     patch(`    if (director?.length && model.includes('4-5')) {
