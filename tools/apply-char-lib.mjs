@@ -207,7 +207,7 @@ function markerPlanFor(text, meta = {}) {
         if (!found) return null;
         return {
             tags: fixedTagsOf(found),
-            appearanceTags: tagText(found.appearance),
+            appearanceTags: typeof canonLookTags === 'function' ? canonLookTags(found, tagText(found.appearance)) : tagText(found.appearance),
             outfitTags: found.outfitMode === 'fixed' ? tagText(currentOutfitOf(found)?.tags) : '',
             nl: String(found.nl || '').trim(),
             uc: String(found.negative || '').trim(),
@@ -309,7 +309,7 @@ export function applyCharLibrary(source) {
 
     // ② 角色的 aliases 字段：新建的角色带上空数组，旧数据没有也照常工作
     patch("const blank = src => ({\n    key: src.key, kind: src.kind, name: src.name, avatar: src.avatar || '', card: src.card || '',\n    appearance: [], outfitMode: 'story', outfits: [], outfitId: '', negative: '', charRef: '',\n});",
-        "const blank = src => ({\n    key: src.key, kind: src.kind, name: src.name, avatar: src.avatar || '', card: src.card || '',\n    appearance: [], aliases: [], nl: '', nsfwBody: '', outfitMode: 'story', outfits: [], outfitId: '', negative: '', charRef: '',\n});",
+        "const blank = src => ({\n    key: src.key, kind: src.kind, name: src.name, avatar: src.avatar || '', card: src.card || '',\n    appearance: [], aliases: [], nl: '', nsfwBody: '', canonOn: false, canonTag: '', canonKeepLook: false, photos: [], outfitMode: 'story', outfits: [], outfitId: '', negative: '', charRef: '',\n});",
         'blank aliases');
 
     // 读角色时把 aliases 归一化（字符串/数组/旧数据都认）
@@ -339,7 +339,7 @@ export function applyCharLibrary(source) {
 
     // 「把一个角色的外貌套到另一个角色上」也带上描述 nl
     patch('    b.negative = a.negative;\n',
-        '    b.negative = a.negative;\n    b.nl = String(a.nl || \'\');\n    b.nsfwBody = String(a.nsfwBody || \'\');\n',
+        '    b.negative = a.negative;\n    b.nl = String(a.nl || \'\');\n    b.nsfwBody = String(a.nsfwBody || \'\');\n    b.canonOn = !!a.canonOn; b.canonTag = String(a.canonTag || \'\'); b.canonKeepLook = !!a.canonKeepLook;\n',
         'copyLook nl');
 
     // ⑤ 分享/导入时带上别名与描述 nl

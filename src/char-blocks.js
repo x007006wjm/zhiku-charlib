@@ -430,6 +430,9 @@ export function normalizeChatEntry(raw) {
         outfitId,
         negative: typeof raw.negative === 'string' ? raw.negative.trim() : '',
         nsfwBody: typeof raw.nsfwBody === 'string' ? raw.nsfwBody.trim() : '',
+        canonOn: !!raw.canonOn,
+        canonTag: typeof raw.canonTag === 'string' ? raw.canonTag.trim() : '',
+        canonKeepLook: !!raw.canonKeepLook,
         source: raw.source === 'ai' ? 'ai' : 'manual',
         history: normalizeHistory(raw.history),
     };
@@ -461,6 +464,9 @@ export function entryFromGlobal(character) {
         outfitId: character?.outfitId,
         negative: character?.negative,
         nsfwBody: character?.nsfwBody,
+        canonOn: character?.canonOn,
+        canonTag: character?.canonTag,
+        canonKeepLook: character?.canonKeepLook,
         source: 'manual',
         history: [],
     });
@@ -480,6 +486,9 @@ export function globalFromChatEntry(entry) {
         outfitId: normalized.outfitId,
         negative: normalized.negative || '',
         nsfwBody: normalized.nsfwBody || '',
+        canonOn: !!normalized.canonOn,
+        canonTag: normalized.canonTag || '',
+        canonKeepLook: !!normalized.canonKeepLook,
         charRef: '',
     };
 }
@@ -505,6 +514,9 @@ export function mergeCharacterLayers(chatEntry, globalChar) {
         outfitId: String(globalChar.outfitId ?? ''),
         negative: typeof globalChar.negative === 'string' ? globalChar.negative.trim() : '',
         nsfwBody: typeof globalChar.nsfwBody === 'string' ? globalChar.nsfwBody.trim() : '',
+        canonOn: !!globalChar.canonOn,
+        canonTag: typeof globalChar.canonTag === 'string' ? globalChar.canonTag.trim() : '',
+        canonKeepLook: !!globalChar.canonKeepLook,
         charRef: String(globalChar.charRef ?? ''),
     };
     const useChatAppearance = chat.appearance.length > 0;
@@ -522,6 +534,9 @@ export function mergeCharacterLayers(chatEntry, globalChar) {
         outfitId: useChatOutfit ? chat.outfitId : (global.outfitId || global.outfits[0]?.id || ''),
         negative: chat.negative || global.negative,
         nsfwBody: chat.nsfwBody || global.nsfwBody,
+        canonOn: chat.canonOn || global.canonOn,
+        canonTag: chat.canonTag || global.canonTag,
+        canonKeepLook: chat.canonKeepLook || global.canonKeepLook,
         charRef: chat.charRef || global.charRef,
     };
     return {

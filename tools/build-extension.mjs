@@ -5,10 +5,11 @@ import {applyUxFixes} from './ux-fixes.mjs';
 import {applyCharLibrary} from './apply-char-lib.mjs';
 import {applyV1Upgrades} from './apply-v1-upgrades.mjs';
 import {applyStorageHardening} from './apply-storage-hardening.mjs';
+import {applyCharWardrobeV2} from './apply-char-wardrobe-v2.mjs';
 import {fileURLToPath} from 'node:url';
 process.chdir(fileURLToPath(new URL('../', import.meta.url)));
 const dir='.';
-const VERSION='1.0.1';
+const VERSION='1.0.2';
 let s=applyMarkers(JSON.parse(fs.readFileSync('zhiku.script.json','utf8')).content);
 function patch(a,b){assert.equal(s.split(a).length,2,a.slice(0,80));s=s.replace(a,()=>b);}
 patch("globalThis.__PC_VERSION = '0.6.3';", `globalThis.__PC_VERSION = '${VERSION}';`);
@@ -204,7 +205,8 @@ s=applyUxFixes(s);
     const ticketParamsHelper = fs.readFileSync('src/ticket-params.js', 'utf8').replace(/^export\s+/gm, '');
     const libMergeHelper = fs.readFileSync('src/library-merge.js', 'utf8').replace(/^export\s+/gm, '');
     const histStoreHelper = fs.readFileSync('src/history-store.js', 'utf8').replace(/^export\s+/gm, '');
-    s = histStoreHelper + '\n' + libMergeHelper + '\n' + ticketParamsHelper + '\n' + streamFinalHelper + '\n' + quotaHelper + '\n' + prHelper + '\n' + weightHelper + '\n' + ucpHelper + '\n' + s;
+    const charEnhanceHelper = fs.readFileSync('src/char-enhance.js', 'utf8').replace(/^export\s+/gm, '');
+    s = charEnhanceHelper + '\n' + histStoreHelper + '\n' + libMergeHelper + '\n' + ticketParamsHelper + '\n' + streamFinalHelper + '\n' + quotaHelper + '\n' + prHelper + '\n' + weightHelper + '\n' + ucpHelper + '\n' + s;
     // 面板顶部剩余额度查询（官方 key / 酒馆 key / 第三方中转站通用）
     patch(`function anlasText(j) {`,
         `async function fetchQuota() {
@@ -773,6 +775,8 @@ function scheduleMesButtons(id) {
 }
 // v1.0.1 存储加固：四重备份 + 多端合并防墓碑死循环 + 独立 IndexedDB 历史生图
 s=applyStorageHardening(s);
+// v1.0.2 角色库 & 衣柜深化全量移植
+s=applyCharWardrobeV2(s);
 const prefix=`// Generated from the full script; edit build-extension.mjs and shared-upload.js.
 export function createRuntime() {
 let stopped = false;
