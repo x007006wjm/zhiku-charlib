@@ -55,7 +55,8 @@ export function applyComicCore(s) {
     // ── 2. 漫画设置读写 + 漫画页 UI + 核心改编/生图/楼层渲染/漫画书阅读器
     patch(
         `function viewStudio(d) {`,
-`const COMIC_FONT_SIZES = { xs: '10px', sm: '12px', md: '14px', lg: '16px', off: '' };
+`const ctx = () => P.SillyTavern?.getContext?.() || {};
+const COMIC_FONT_SIZES = { xs: '10px', sm: '12px', md: '14px', lg: '16px', off: '' };
 function comicOpts(d = getData()) {
     const o = d.options.comic ||= {};
     return {

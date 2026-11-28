@@ -865,7 +865,7 @@ function deleteUcpPreset(presets, id) {
     return normalizeUcpPresets(presets).filter(p => p.id !== target);
 }
 
-// 智库 · 原生扩展版 v1.0.4（二改自从前佬的智绘姬）
+// 智库 · 原生扩展版 v1.0.5（二改自从前佬的智绘姬）
 // 不需要智绘姬，填 NovelAI key 就能用。
 // NovelAI 请求格式参考了智绘姬（作者：从前跟你一样，https://github.com/damoshen123/st-chatu8，AFPL v9）。
 const P = (() => { try { if (window.parent && window.parent !== window && window.parent.document) return window.parent; } catch (e) { /* 跨域 */ } return window; })();
@@ -883,7 +883,7 @@ const __shim = {
     get extension_settings() { return __ctx().extensionSettings; },
 };
 
-globalThis.__PC_VERSION = '1.0.4';
+globalThis.__PC_VERSION = '1.0.5';
 
 // ───── model.js ─────
 const __mod_model = (() => {
@@ -5902,6 +5902,7 @@ function addArtistPrefix(text, names) {
     return s;
 }
 
+const ctx = () => P.SillyTavern?.getContext?.() || {};
 const COMIC_FONT_SIZES = { xs: '10px', sm: '12px', md: '14px', lg: '16px', off: '' };
 function comicOpts(d = getData()) {
     const o = d.options.comic ||= {};
