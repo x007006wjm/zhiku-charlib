@@ -8,6 +8,140 @@ function setTimeout(fn, delay, ...args) {
     timers.add(id); return id;
 }
 function clearTimeout(id) { window.clearTimeout(id); timers.delete(id); }
+// 画师串 / 单个画师独立出图参数（模型、采样器、噪声计划、步数、CFG、Rescale）
+// 空项沿用全局设置；用这串出图时临时套用，不改全局设置。
+
+const TICKET_PARAM_KEYS = ['steps', 'cfg', 'rescale', 'sampler', 'schedule'];
+
+function hasTicketParams(it) {
+    if (!it || typeof it !== 'object') return false;
+    return String(it.model ?? '').trim() !== '' || TICKET_PARAM_KEYS.some(k => String(it[k] ?? '').trim() !== '');
+}
+
+function applyItemParams(baseSettings, it) {
+    if (!hasTicketParams(it)) return baseSettings;
+    const out = { ...baseSettings };
+    const num = (v, lo, hi) => {
+        if (String(v ?? '').trim() === '') return null;
+        const n = Number(v);
+        return Number.isFinite(n) && n >= lo && n <= hi ? n : null;
+    };
+    const model = String(it.model ?? '').trim();
+    if (model && /^nai-diffusion-/.test(model)) out.novelaimode = model;
+    const steps = num(it.steps, 1, 50);
+    const cfg = num(it.cfg, 0, 30);
+    const rescale = num(it.rescale, 0, 1);
+    if (steps != null) out.novelai_steps = Math.round(steps);
+    if (cfg != null) out.nai3Scale = cfg;
+    if (rescale != null) out.cfg_rescale = rescale;
+    if (typeof it.sampler === 'string' && /^(?:k_\w+|ddim_v3)$/.test(it.sampler)) out.novelai_sampler = it.sampler;
+    if (typeof it.schedule === 'string' && /^\w+$/.test(it.schedule)) out.Schedule = it.schedule;
+    return out;
+}
+
+/**
+ * 根据当前发送的正面提示词，匹配命中的画师串 / 单个画师（设了独立出图参数的）：
+ * - 正面里必须包含该串的全部标签；命中多串时取标签数最多的那串（画师组优先于单个画师）。
+ * - 单个画师仅在它自己就是 d.active，或者正面里只有它 1 位画师时生效（避免组内单个画师覆盖整组参数）。
+ */
+function findTicketParamsFor(d, positive, M) {
+    if (!d || !M) return null;
+    const norm = t => String(t).trim().toLowerCase().replace(/\s+/g, ' ').replace(/\s+::/g, '::');
+    const tagsOf = str => String(str || '').split(/[,\n]/).map(norm).filter(Boolean);
+    const pos = tagsOf(positive);
+    const have = new Set(pos);
+    const artistsInPos = pos.filter(t => /^(?:-?\d+(?:\.\d+)?::)?\W*artist:/.test(t)).length;
+    const cands = [];
+    if (d.active) {
+        const t = M.resolveTicket(d, d.active);
+        if (hasTicketParams(t?.item)) cands.push([d.active, t.item]);
+    }
+    for (const g of Object.values(d.groups || {})) {
+        if (hasTicketParams(g)) cands.push([{ type: 'group', id: g.id }, g]);
+    }
+    for (const a of Object.values(d.artists || {})) {
+        if (hasTicketParams(a)) cands.push([{ type: 'artist', id: a.id }, a]);
+    }
+    let best = null, bestN = 0;
+    for (const [ref, it] of cands) {
+        if (ref.type === 'artist' && !(d.active?.type === 'artist' && d.active.id === ref.id) && artistsInPos > 1) continue;
+        const tags = tagsOf(M.ticketString(d, ref));
+        if (tags.length > bestN && tags.every(t => have.has(t))) {
+            best = it;
+            bestN = tags.length;
+        }
+    }
+    return best;
+}
+
+// NovelAI 流式返回 / 多图 ZIP 最终图挑选与防预览噪点校验
+
+function pngPixelArea(u8) {
+    try {
+        if (!(u8 instanceof Uint8Array) || u8.length < 24) return 0;
+        if (u8[0] !== 0x89 || u8[1] !== 0x50 || u8[2] !== 0x4e || u8[3] !== 0x47) return 0;
+        const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+        return dv.getUint32(16) * dv.getUint32(20);
+    } catch {
+        return 0;
+    }
+}
+
+/** 从可能包含多张拼接 PNG（流式预览 + 最终图）的字节流中切出所有 PNG 帧 */
+function extractPngFrames(u8) {
+    if (!(u8 instanceof Uint8Array) || u8.length < 24) return [];
+    const frames = [];
+    let i = 0;
+    while (i + 8 <= u8.length) {
+        if (u8[i] === 0x89 && u8[i + 1] === 0x50 && u8[i + 2] === 0x4e && u8[i + 3] === 0x47 &&
+            u8[i + 4] === 0x0d && u8[i + 5] === 0x0a && u8[i + 6] === 0x1a && u8[i + 7] === 0x0a) {
+            // 扫描 IEND 块结束位置（49 45 4E 44 AE 42 60 82）
+            let end = -1;
+            let p = i + 8;
+            while (p + 12 <= u8.length) {
+                const dv = new DataView(u8.buffer, u8.byteOffset + p, 8);
+                const len = dv.getUint32(0);
+                const isIend = u8[p + 4] === 0x49 && u8[p + 5] === 0x45 && u8[p + 6] === 0x4e && u8[p + 7] === 0x44;
+                const next = p + 12 + len;
+                if (next > u8.length) break;
+                p = next;
+                if (isIend) { end = p; break; }
+            }
+            if (end > i) {
+                frames.push(u8.subarray(i, end));
+                i = end;
+                continue;
+            }
+            frames.push(u8.subarray(i));
+            break;
+        }
+        i++;
+    }
+    return frames;
+}
+
+/**
+ * 从候选图列表中按 PNG 像素面积挑出最终图（同最大面积取最后一张）。
+ * 若已知目标尺寸 want={w,h} 且最大图面积小于目标面积的 25%，说明只收到中间预览图，抛出可重试错误。
+ */
+function pickFinalImageFrame(list, want = null) {
+    if (!Array.isArray(list) || !list.length) throw new Error('响应里没有图片');
+    const sizes = list.map(f => (f instanceof Uint8Array ? pngPixelArea(f) : 0));
+    let best = list.length - 1;
+    if (sizes.some(Boolean)) {
+        const max = Math.max(...sizes);
+        best = sizes.lastIndexOf(max);
+    }
+    const wantArea = want && Number(want.w) > 0 && Number(want.h) > 0 ? Number(want.w) * Number(want.h) : 0;
+    if (wantArea && sizes[best] > 1 && sizes[best] < wantArea * 0.25) {
+        throw Object.assign(
+            new Error('只收到生成中的预览图，最终图没传回来（多半是连接中途断了或站点超时）。重试一下；老是这样就把尺寸或步数调小，或换个连接方式'),
+            { retryable: true }
+        );
+    }
+    return list[best];
+}
+
 // 剩余额度（Anlas / 中转站点数）URL 推导与响应解析。
 // 支持 NovelAI 官方 /user/subscription、酒馆 /api/novelai/status，以及常见第三方中转站余额字段。
 
@@ -255,7 +389,7 @@ function deleteUcpPreset(presets, id) {
     return normalizeUcpPresets(presets).filter(p => p.id !== target);
 }
 
-// 智库 · 原生扩展版 v0.8.20（二改自从前佬的智绘姬）
+// 智库 · 原生扩展版 v1.0.0（二改自从前佬的智绘姬）
 // 不需要智绘姬，填 NovelAI key 就能用。
 // NovelAI 请求格式参考了智绘姬（作者：从前跟你一样，https://github.com/damoshen123/st-chatu8，AFPL v9）。
 const P = (() => { try { if (window.parent && window.parent !== window && window.parent.document) return window.parent; } catch (e) { /* 跨域 */ } return window; })();
@@ -273,7 +407,7 @@ const __shim = {
     get extension_settings() { return __ctx().extensionSettings; },
 };
 
-globalThis.__PC_VERSION = '0.8.20';
+globalThis.__PC_VERSION = '1.0.0';
 
 // ───── model.js ─────
 const __mod_model = (() => {
@@ -466,9 +600,13 @@ function tokenize(text) {
             tokens.push({ text: t, weight: round2(weight * outer), isArtist: /^artist\s*:/i.test(t), raw: outer === 1 ? raw : null });
         }
     };
+    let gid = 0;
     while ((m = re.exec(src))) {
         pushPlain(src.slice(last, m.index));
+        const before = tokens.length;
         pushPlain(m[2], Number(m[1]));
+        const grp = { id: ++gid, raw: m[0], n: tokens.length - before };
+        for (let i = before; i < tokens.length; i++) Object.defineProperty(tokens[i], 'grp', { value: grp, enumerable: false });
         last = re.lastIndex;
     }
     pushPlain(src.slice(last));
@@ -734,7 +872,19 @@ function findTicketForString(data, text) {
 function mergeTags(...texts) {
     const seen = new Set();
     const out = [];
-    for (const t of tokenize(texts.filter(Boolean).join(', '))) {
+    const toks = tokenize(texts.filter(Boolean).join(', '));
+    for (let i = 0; i < toks.length; i++) {
+        const t = toks[i];
+        if (t.grp && t.grp.n > 1) {
+            const members = toks.slice(i, i + t.grp.n).filter(x => x.grp === t.grp);
+            const keys = members.map(tokKey);
+            if (members.length === t.grp.n && keys.every(k => !seen.has(k))) {
+                keys.forEach(k => seen.add(k));
+                out.push(guardWeightSpacing(t.grp.raw.trim()));
+                i += members.length - 1;
+                continue;
+            }
+        }
         const k = tokKey(t);
         if (seen.has(k)) continue;
         seen.add(k);
@@ -1062,11 +1212,18 @@ function skipSigma(w, h, model) {
  * chars：[{ prompt, uc, center:{x,y} }]（分角色，可不填）
  * refs：{ images:[base64], strengths:[], infos:[] }（氛围，可不填）
  */
+function pcWithTicketParams(baseSettings, positive) {
+    try {
+        const it = findTicketParamsFor(__mod_store.getData(), positive, __mod_model);
+        return it ? applyItemParams(baseSettings, it) : baseSettings;
+    } catch { return baseSettings; }
+}
 function buildParameters({ positive, negative, width, height, seed, chars = [], refs = null, director = null }) {
+    const rawPos = positive;
     positive = guardWeightSpacing(positive);
     negative = guardWeightSpacing(negative);
     chars = (chars || []).map(c => ({ ...c, prompt: guardWeightSpacing(c.prompt), uc: guardWeightSpacing(c.uc || '') }));
-    const s = settings();
+    const s = pcWithTicketParams(settings(), rawPos);
     const model = s.novelaimode;
     const isV3 = model === 'nai-diffusion-3';
     const isV5 = model.includes('nai-diffusion-5');
@@ -1181,7 +1338,7 @@ function createNaiGate({sleep=ms=>new Promise(r=>setTimeout(r,ms)),now=()=>Date.
 const __naiGate=createNaiGate({notice:message=>toastr.info(message,'智库 · 生图排队')});
 function generate(opts){return __naiGate.run(()=>generateRequest(opts));}
 async function generateRequest(opts) {
-    const s = settings();
+    const s = pcWithTicketParams(settings(), opts?.positive);
     const model = s.novelaimode;
     const params = buildParameters(opts);
     const sent = {
@@ -1212,7 +1369,7 @@ async function generateRequest(opts) {
     });
     const buf = new Uint8Array(await r.arrayBuffer());
     if (!r.ok) throw Object.assign(new Error(explain(r.status, new TextDecoder().decode(buf))),{status:r.status,retryAfter:r.headers?.get('Retry-After')});
-    return { image: await imageFromResponse(buf), sent };
+    return { image: await imageFromResponse(buf, { w: params.width, h: params.height }), sent };
 }
 
 function toDataUrl(b64) {
@@ -1236,19 +1393,34 @@ function explain(status, text, viaTavern = false) {
 
 // ───────────── 解压返回的 zip ─────────────
 
-async function imageFromResponse(u8) {
+async function imageFromResponse(u8, want = null) {
     const isZip = u8[0] === 0x50 && u8[1] === 0x4b;
     const isPng = u8[0] === 0x89 && u8[1] === 0x50;
-    if (isPng) return 'data:image/png;base64,' + toB64(u8);
+    if (isPng) {
+        const frames = extractPngFrames(u8);
+        const picked = pickFinalImageFrame(frames.length ? frames : [u8], want);
+        return 'data:image/png;base64,' + toB64(picked);
+    }
     if (!isZip) {
+        const frames = extractPngFrames(u8);
+        if (frames.length) {
+            const picked = pickFinalImageFrame(frames, want);
+            return 'data:image/png;base64,' + toB64(picked);
+        }
         const t = new TextDecoder().decode(u8.slice(0, 2000)).trim();
-        if (t.startsWith('{')) { try { const j = JSON.parse(t); if (j.images?.[0]) return toDataUrl(j.images[0]); throw new Error(j.message || j.error || t.slice(0, 150)); } catch (e) { throw e; } }
+        if (t.startsWith('{')) {
+            const j = JSON.parse(t);
+            if (Array.isArray(j.images) && j.images.length) return toDataUrl(j.images[j.images.length - 1]);
+            if (j.image) return toDataUrl(j.image);
+            throw new Error(j.message || j.error || t.slice(0, 150));
+        }
         if (t.startsWith('iVBOR')) return toDataUrl(t);
         if (/^<|<html/i.test(t)) throw new Error('站点返回的是网页，不是图片。检查一下地址对不对');
         throw new Error('返回的不是图片：' + t.slice(0, 120));
     }
-    const file = await unzipFirstImage(u8);
-    return 'data:image/png;base64,' + toB64(file);
+    const files = await unzipAllImages(u8);
+    const picked = pickFinalImageFrame(files, want);
+    return 'data:image/png;base64,' + toB64(picked);
 }
 
 function toB64(u8) {
@@ -1258,14 +1430,14 @@ function toB64(u8) {
 }
 
 /** 只认 zip 里的第一张图（NovelAI 返回的就是一个 image_0.png） */
-async function unzipFirstImage(u8) {
+async function unzipAllImages(u8) {
     const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
-    // 找中央目录结尾
     let eocd = -1;
     for (let i = u8.length - 22; i >= Math.max(0, u8.length - 65557); i--) if (dv.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
     if (eocd < 0) throw new Error('图片压缩包坏了');
     const count = dv.getUint16(eocd + 10, true);
     let p = dv.getUint32(eocd + 16, true);
+    const outList = [];
     for (let n = 0; n < count; n++) {
         if (dv.getUint32(p, true) !== 0x02014b50) break;
         const method = dv.getUint16(p + 10, true);
@@ -1278,15 +1450,17 @@ async function unzipFirstImage(u8) {
         const lName = dv.getUint16(local + 26, true), lExtra = dv.getUint16(local + 28, true);
         const start = local + 30 + lName + lExtra;
         const data = u8.subarray(start, start + csize);
-        if (method === 0) return data;
-        if (method === 8) {
+        if (method === 0) outList.push(data);
+        else if (method === 8) {
             const ds = new DecompressionStream('deflate-raw');
             const out = await new Response(new Blob([data]).stream().pipeThrough(ds)).arrayBuffer();
-            return new Uint8Array(out);
+            outList.push(new Uint8Array(out));
+        } else {
+            throw new Error('不认识的压缩方式 ' + method);
         }
-        throw new Error('不认识的压缩方式 ' + method);
     }
-    throw new Error('压缩包里没有图片');
+    if (!outList.length) throw new Error('压缩包里没有图片');
+    return outList;
 }
 
 // ───────────── 测试 key、查点数 ─────────────
@@ -1790,7 +1964,7 @@ async function insertIntoLastMessage(dataUrl) {
     const { url } = await uploadImage(dataUrl, `chat_${Date.now()}`);
     const msg = c.chat[idx];
     msg.mes = `${msg.mes || ''}\n\n<img src="${url}" alt="画师库生成">`;
-    c.updateMessageBlock(idx, msg);
+    (guardChatScroll(DOC), c).updateMessageBlock(idx, msg);
     await c.saveChat();
 }
 
@@ -3568,7 +3742,7 @@ async function insertImage(mesId, dataUrl) {
     const msg = c.chat[mesId];
     const { url } = await uploadImage(dataUrl, `chat_${Date.now()}`);
     msg.mes = `${msg.mes || ''}\n\n<img src="${url}" alt="画师库生成" class="pc-chat-img">`;
-    c.updateMessageBlock(mesId, msg);
+    (guardChatScroll(DOC), c).updateMessageBlock(mesId, msg);
     await c.saveChat();
 }
 
@@ -3971,15 +4145,80 @@ const MARKER_REGEX_ID = '72c57f73-46af-46ac-a28e-bf31b131332a';
 const MARKER_DISPLAY_ID = '6ba93a8e-cabb-494c-a7e8-6c9dfcf5fb80';
 const CHAR_BLOCK_DISPLAY_ID = 'a7c1d9b4-2f5e-4c6a-9d31-8b0f4e2a5c77';
 const CHAR_BLOCK_RE_SOURCE = '[<＜](?:人物|外貌变化)[>＞][\\s\\S]*?[<＜][/／](?:人物|外貌变化)[>＞]';
+function guardChatScroll(doc = globalThis.document) {
+    try {
+        const chat = doc?.getElementById?.('chat');
+        if (!chat || typeof chat.getBoundingClientRect !== 'function') return;
+        if (chat.scrollHeight - chat.scrollTop - chat.clientHeight < 8) return; // 本来就在最底下：不动
+        const top0 = chat.getBoundingClientRect().top;
+        const list = [...chat.querySelectorAll(':scope > .mes')];
+        const anchor = list.find(m => m.getBoundingClientRect().bottom > top0 + 10);
+        if (!anchor) return;
+        const mesid = anchor.getAttribute('mesid');
+        const off = anchor.getBoundingClientRect().top - top0;
+        const token = {};
+        guardChatScroll._cur = token;
+        let quit = false;
+        const stop = () => { quit = true; };
+        for (const ev of ['wheel', 'touchmove', 'keydown', 'mousedown']) {
+            chat.addEventListener(ev, stop, { passive: true, once: true });
+        }
+        const find = () => chat.querySelector(`:scope > .mes[mesid="${mesid}"]`);
+        const fix = () => {
+            if (quit || guardChatScroll._cur !== token) return;
+            const m = find();
+            if (!m) return;
+            const d = (m.getBoundingClientRect().top - chat.getBoundingClientRect().top) - off;
+            if (Math.abs(d) > 1) chat.scrollTop += d;
+        };
+        if (typeof globalThis.requestAnimationFrame === 'function') globalThis.requestAnimationFrame(fix);
+        for (const t of [0, 60, 300, 800, 1500, 2500, 4000]) setTimeout(fix, t);
+        let ro = null, mo = null;
+        try {
+            if (typeof globalThis.ResizeObserver === 'function') {
+                ro = new ResizeObserver(fix);
+                for (const m of chat.querySelectorAll(':scope > .mes')) ro.observe(m);
+            }
+        } catch { ro = null; }
+        try {
+            if (typeof globalThis.MutationObserver === 'function') {
+                mo = new MutationObserver(() => {
+                    fix();
+                    try { for (const m of chat.querySelectorAll(':scope > .mes')) ro?.observe(m); } catch {}
+                });
+                mo.observe(chat, { childList: true, subtree: true });
+            }
+        } catch { mo = null; }
+        setTimeout(() => {
+            ro?.disconnect();
+            mo?.disconnect();
+            if (guardChatScroll._cur === token) guardChatScroll._cur = null;
+        }, 5000);
+    } catch { /* 钉不住就算了，不影响改楼层 */ }
+}
 function escapeMarker(value) { return value.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&'); }
 function markerPattern(start, end) { return escapeMarker(start) + '[\\s\\S]*?' + escapeMarker(end); }
+const THINK_BLOCK_RE = /<\s*(think[\w-]*|thoughts?|reasoning|reason|cot|inner[_-]?thoughts?|analysis|plann?ing|plans?|思考|思维链?|推理|规划)(?:\s[^>]*)?>[\s\S]*?(?:<\/\s*\1\s*>|$)/gi;
+function markerSkipRanges(text) {
+    const t = String(text || ''), out = [];
+    for (const m of t.matchAll(THINK_BLOCK_RE)) out.push([m.index, m.index + m[0].length]);
+    for (const m of t.matchAll(/```[\s\S]*?(?:```|$)/g)) out.push([m.index, m.index + m[0].length]);
+    for (const m of t.matchAll(/`[^`\n]+`/g)) out.push([m.index, m.index + m[0].length]);
+    return out;
+}
+function isPlaceholderPrompt(p) {
+    const t = String(p || '').replace(/[\s.。…·•_\-—~～,，、]+/g, '');
+    return !t || /^(x{2,}|tags?|prompts?|提示词|标签|内容|英文标签|英文提示词|tag内容)$/i.test(t);
+}
 function parseImageMarkers(text, start, end) {
     if (!start || !end) return [];
-    const result=[];
+    const result=[], src=String(text || ''), skip=markerSkipRanges(src);
     const regex=new RegExp(escapeMarker(start)+'([\\s\\S]*?)'+escapeMarker(end),'g');
-    for (const m of String(text || '').matchAll(regex)) {
+    for (const m of src.matchAll(regex)) {
         const prompt=m[1].trim();
-        if (prompt) result.push({raw:m[0],prompt,index:m.index});
+        if (!prompt || isPlaceholderPrompt(prompt)) continue;
+        if (skip.some(([a, b]) => m.index >= a && m.index < b)) continue;
+        result.push({raw:m[0],prompt,index:m.index});
     }
     return result;
 }
@@ -4107,13 +4346,13 @@ function createMarkerController({context,getData,generate,upload,notify,expandPr
     const pregenSeen=new Set();
     function pregenSlot(chat,floor,msg,token){return chat+'|'+floor+'|'+recordKey(msg,token);}
     function pregenSeenKey(chat,token){return chat+'|'+String(token?.prompt||'');}
-    /** 剥离推理模型的 <think>/<thinking>/<thought> 思考过程，避免误预生成思考草稿里的标记。 */
+    /** 剥离推理模型的思考与规划块（<think_xxx>/<thinking>/<thought>/<reasoning>/<plan>/<planning>/<思考> 等），避免误预生成思考草稿里的标记。 */
     function stripThinking(text){
         if(!text||typeof text!=='string')return '';
-        let cleaned=text.replace(/<\s*(?:think(?:ing)?|thought)(?:\s+[^>]*)?>[\s\S]*?<\/\s*(?:think(?:ing)?|thought)\s*>/gi,'');
-        const closeMatch=cleaned.match(/<\/\s*(?:think(?:ing)?|thought)\s*>/i);
+        let cleaned=text.replace(/<\s*(think[\w-]*|thoughts?|reasoning|reason|cot|inner[_-]?thoughts?|analysis|plann?ing|plans?|思考|思维链?|推理|规划)(?:\s[^>]*)?>[\s\S]*?<\/\s*\1\s*>/gi,'');
+        const closeMatch=cleaned.match(/<\/\s*(?:think[\w-]*|thoughts?|reasoning|reason|cot|inner[_-]?thoughts?|analysis|plann?ing|plans?|思考|思维链?|推理|规划)\s*>/i);
         if(closeMatch&&closeMatch.index!==undefined)cleaned=cleaned.slice(closeMatch.index+closeMatch[0].length);
-        const openMatch=cleaned.match(/<\s*(?:think(?:ing)?|thought)(?:\s+[^>]*)?>/i);
+        const openMatch=cleaned.match(/<\s*(?:think[\w-]*|thoughts?|reasoning|reason|cot|inner[_-]?thoughts?|analysis|plann?ing|plans?|思考|思维链?|推理|规划)(?:\s[^>]*)?>/i);
         if(openMatch&&openMatch.index!==undefined)cleaned=cleaned.slice(0,openMatch.index);
         return cleaned;
     }
@@ -4350,7 +4589,7 @@ function createMarkerController({context,getData,generate,upload,notify,expandPr
                 const next=source.slice(0,tag.index)+raw+source.slice(tag.index+tag[0].length);
                 const swipes=Array.isArray(msg.swipes)&&Number.isInteger(swipe)?msg.swipes:null,oldSwipe=swipes?.[swipe];
                 msg.mes=next;if(swipes)swipes[swipe]=next;
-                try {await context().saveChat();context().updateMessageBlock(id,msg);decorate(id);}
+                try {await context().saveChat();guardChatScroll(doc);context().updateMessageBlock(id,msg);decorate(id);}
                 catch(e){msg.mes=source;if(swipes)swipes[swipe]=oldSwipe;notify(e.message||String(e),'error');}
             };
             img.addEventListener('contextmenu',e=>{e.preventDefault();bar.hidden=false;remove.focus();});
@@ -4668,7 +4907,8 @@ function applyArtistToStudio(ref) {
     saveStudio();
 }
 /** 固定提示词：有中文的先让 AI 转成标签，转过一次就记住，中文改了才重新转 */
-function sceneZh() { return T.hasChinese(ui.studio.scene || ''); }
+function pcV5Zh() { try { const n = N.settings(); return String(n.novelaimode || '').includes('nai-diffusion-5') && String(n.v5Chinese) !== 'false'; } catch { return false; } }
+function sceneZh() { return !pcV5Zh() && T.hasChinese(ui.studio.scene || ''); }
 function sceneReady() { const st = ui.studio; return !sceneZh() || !!(String(st.sceneEn || '').trim() && st.sceneSrc === String(st.scene || '').trim()); }
 function sceneStateText() { return sceneReady() ? '有中文，实际发的是下面 AI 转好的英文标签。' : ui.studio.sceneEn ? '中文改过了：生成时会先用 AI 重新转成标签。' : '有中文，NovelAI 看不懂：生成时会先用 AI 转成标签，转一次就记住。'; }
 function sceneTags() {
@@ -4796,6 +5036,7 @@ function viewStudio(d) {
     </section>` : ''}
 
     ${fold('scene', '固定提示词', st.sceneOn === false ? '不发送' : !String(st.scene || '').trim() ? '跟着发送 · 还没写' : !sceneReady() ? '跟着发送 · 生成时转成标签' : `跟着发送 · ${M.tokenize(sceneTags()).length} 个词`, `
+      ${String(N.settings().novelaimode || '').includes('nai-diffusion-5') ? `<label class="pc-switch"><input type="checkbox" data-st-check="v5Chinese" ${String(N.settings().v5Chinese) !== 'false' ? 'checked' : ''}><span></span>V5 直接看中文<small>V5 能直接理解中文，正面和固定提示词里的中文原样发过去，不再调用翻译 AI；关掉就照旧先转成英文标签</small></label>` : ''}
       <label class="pc-switch"><input type="checkbox" data-scene-on ${st.sceneOn !== false ? 'checked' : ''}><span></span>每次生成都带上<small>接在正面提示词后面、质量词前面一起发。不改你的正面提示词，也不进画师串。</small></label>
       <textarea id="pc-scene" class="pc-textarea small" data-bind="studio.scene" placeholder="中文英文都行。比如：坐在窗边喝咖啡，外面下雨 / 1boy, sitting, window, rain">${esc(st.scene || '')}</textarea>
       <div id="pc-scene-ai" ${sceneZh() ? '' : 'hidden'}>
@@ -4881,7 +5122,112 @@ function bookList(d) {
     return list.map(x => ({ type: groups ? 'group' : 'artist', id: x.id }));
 }
 
+const PC_TRASH_DAYS = 7;
+function pcTrash(d) { return Array.isArray(d.options.trash) ? d.options.trash : (d.options.trash = []); }
+function pcTrashPut(d, refs) {
+    const out = [];
+    for (const r of refs) {
+        const it = r.type === 'group' ? d.groups[r.id] : d.artists[r.id];
+        if (!it) continue;
+        const groups = r.type === 'artist'
+            ? Object.values(d.groups).flatMap(g => (g.members || []).filter(m => m.artistId === r.id).map(m => ({ gid: g.id, weight: m.weight ?? 1 })))
+            : [];
+        const e = { tid: M.uid('tr_'), type: r.type, item: structuredClone(it), groups, at: Date.now() };
+        pcTrash(d).unshift(e);
+        out.push(e.tid);
+    }
+    return out;
+}
+function pcTrashRestore(d, tids) {
+    const list = pcTrash(d);
+    let n = 0;
+    for (const tid of tids) {
+        const i = list.findIndex(e => e.tid === tid);
+        if (i < 0) continue;
+        const e = list[i];
+        list.splice(i, 1);
+        if (e.type === 'artist') {
+            const exist = M.findArtistByTag(d, e.item.tag);
+            let id;
+            if (exist) {
+                id = exist.id;
+                const have = new Set((exist.images || []).map(x => x.path));
+                for (const im of e.item.images || []) if (!have.has(im.path)) (exist.images ||= []).push(im);
+                if (!exist.note && e.item.note) exist.note = e.item.note;
+            } else {
+                id = M.uid('a_');
+                d.artists[id] = { ...structuredClone(e.item), id };
+            }
+            for (const g of e.groups || []) {
+                const grp = d.groups[g.gid];
+                if (grp && !grp.members.some(m => m.artistId === id)) grp.members.push({ artistId: id, weight: g.weight ?? 1 });
+            }
+        } else {
+            const id = M.uid('g_'), g = { ...structuredClone(e.item), id };
+            g.members = (g.members || []).filter(m => d.artists[m.artistId]);
+            d.groups[id] = g;
+        }
+        n++;
+    }
+    return n;
+}
+function pcTrashPurge(d, only = null) {
+    const list = pcTrash(d), cut = Date.now() - PC_TRASH_DAYS * 864e5;
+    const drop = list.filter(e => only ? only.includes(e.tid) : e.at < cut);
+    if (!drop.length) return 0;
+    d.options.trash = list.filter(e => !drop.includes(e));
+    const live = new Set([...Object.values(d.artists), ...Object.values(d.groups), ...d.options.trash.map(e => e.item)].flatMap(x => (x.images || []).map(i => i.path)));
+    for (const e of drop) for (const i of e.item.images || []) if (i.path && !live.has(i.path)) deleteImageFile(i.path);
+    return drop.length;
+}
+function pcUndoBar(text, onUndo) {
+    DOC.getElementById('pc-undobar')?.remove();
+    const el = DOC.createElement('div');
+    el.id = 'pc-undobar';
+    el.setAttribute('style', 'position:fixed;left:12px;right:12px;bottom:max(18px,env(safe-area-inset-bottom));z-index:2147483646;display:flex;align-items:center;gap:10px;max-width:520px;margin:0 auto;padding:10px 14px;border-radius:14px;background:#3a2e26;color:#f4efe4;font-size:14px;box-shadow:0 6px 20px rgba(0,0,0,.25);box-sizing:border-box');
+    el.innerHTML = `<span style="flex:1">${esc(text)}</span><button type="button" style="font:inherit;border:0;border-radius:999px;padding:4px 14px;background:#f4efe4;color:#3a2e26;cursor:pointer">撤销</button>`;
+    el.querySelector('button').addEventListener('click', ev => { ev.stopPropagation(); el.remove(); onUndo(); });
+    pcMount(el);
+    setTimeout(() => el.remove(), 9000);
+}
+function pcUndoDelete(tids, what) {
+    pcUndoBar(`删掉了 ${what} · 回收站里 ${PC_TRASH_DAYS} 天内能放回`, () => {
+        const n = pcTrashRestore(getData(), tids);
+        commit(); render();
+        toastr.success(`放回了 ${n} 个`, '智库', { timeOut: 1800 });
+    });
+}
+function pcBookSeg(d) {
+    const n = pcTrash(d).length;
+    const bs = n ? ' style="flex:1;min-width:0;white-space:nowrap;padding-left:4px;padding-right:4px"' : '';
+    return `<div class="pc-seg pc-mt-s"${n ? ' style="display:flex;flex-wrap:nowrap"' : ''}>
+      <button${bs} class="${ui.bookTab === 'groups' ? 'on' : ''}" data-act="booktab" data-tab="groups">画师组 · ${Object.keys(d.groups).length}</button>
+      <button${bs} class="${ui.bookTab === 'artists' ? 'on' : ''}" data-act="booktab" data-tab="artists">单个画师 · ${Object.keys(d.artists).length}</button>
+      ${n || ui.bookTab === 'trash' ? `<button${bs || ' style="flex:1;min-width:0;white-space:nowrap;padding-left:4px;padding-right:4px"'} class="${ui.bookTab === 'trash' ? 'on' : ''}" data-act="booktab" data-tab="trash">回收站 · ${n}</button>` : ''}
+    </div>`;
+}
+function pcTrashView(d) {
+    if (pcTrashPurge(d)) commit({ silent: true });
+    const list = pcTrash(d);
+    const fmt = t => { const x = new Date(t); return `${x.getMonth() + 1}/${x.getDate()} ${String(x.getHours()).padStart(2, '0')}:${String(x.getMinutes()).padStart(2, '0')}`; };
+    const left = e => Math.max(1, Math.ceil((e.at + PC_TRASH_DAYS * 864e5 - Date.now()) / 864e5));
+    const row = e => {
+        const name = e.type === 'group' ? e.item.name || '没起名的画师组' : String(e.item.tag || '').replace(/^artist:/, '');
+        const n = (e.item.images || []).length;
+        return `<div class="pc-li" style="display:flex;gap:10px;align-items:center">
+          <div class="pc-grow" style="min-width:0"><b class="mono" style="word-break:break-all">${esc(name)}</b>
+            <div class="pc-dim small">${e.type === 'group' ? '画师组' : '画师'} · 删于 ${fmt(e.at)} · 还剩 ${left(e)} 天${n ? ` · ${n} 张例图` : ''}</div></div>
+          <button class="pc-pill tiny on" data-act="trashrestore" data-t="${esc(e.tid)}">放回</button>
+          <button class="pc-pill tiny dashed danger" data-act="trashpurge" data-t="${esc(e.tid)}">彻底删</button></div>`;
+    };
+    return `${pcBookSeg(d)}
+    <section class="pc-card pc-pad pc-mt-s"><div class="pc-dim small" style="margin:0">删掉的画师和画师组先放在这里，例图也先留着，${PC_TRASH_DAYS} 天后自动清掉。放回后会回到原来的画师组里。</div>
+    ${list.length ? `<div class="pc-actions wrap pc-mt-s"><button class="pc-pill dashed tiny" data-act="trashrestoreall">全部放回</button><button class="pc-pill tiny danger" data-act="trashempty">清空回收站</button></div>` : ''}</section>
+    <div class="pc-mt-s">${list.map(row).join('') || empty('回收站是空的', '删掉的画师和画师组会先放在这里。')}</div>
+    <div style="height:24px"></div>`;
+}
 function viewBook(d) {
+    if (ui.bookTab === 'trash') return pcTrashView(d);
     const cols = Object.values(d.collections);
     const view = d.options.bookView || 'grid';
     const refs = bookList(d);
@@ -4892,22 +5238,24 @@ function viewBook(d) {
       <div class="pc-vt"><button class="${view === 'grid' ? 'on' : ''}" data-act="bookview" data-v="grid" aria-label="网格">${SYM.grid}</button><button class="${view === 'list' ? 'on' : ''}" data-act="bookview" data-v="list" aria-label="列表">${SYM.list}</button></div>
       <button class="pc-add" data-act="register" aria-label="添加">＋</button>
     </div>
-    <div class="pc-seg pc-mt-s">
-      <button class="${ui.bookTab === 'groups' ? 'on' : ''}" data-act="booktab" data-tab="groups">画师组 · ${Object.keys(d.groups).length}</button>
-      <button class="${ui.bookTab === 'artists' ? 'on' : ''}" data-act="booktab" data-tab="artists">单个画师 · ${Object.keys(d.artists).length}</button>
-    </div>
+    ${pcBookSeg(d)}
     <div class="pc-chips">
       ${[['all', '全部'], ['fav', '收藏'], ...cols.map(c => [c.id, c.name])].map(([k, t]) => `<button class="pc-pill ${ui.bookFilter === k ? 'on' : 'dashed'}" data-act="bookfilter" data-f="${esc(k)}" ${d.collections[k] ? `data-lp="col" data-col="${esc(k)}"` : ''}>${esc(t)}</button>`).join('')}
       <button class="pc-pill dashed" data-act="newcol">＋</button>
       <button class="pc-pill ${ui.selecting ? 'on' : 'dashed'}" data-act="selmode">${ui.selecting ? '退出多选' : '多选'}</button>
     </div>
     ${cols.length && !ui.selecting ? '<div class="pc-tip">长按标签可以改名或删除</div>' : ''}
-    ${ui.selecting ? `<div class="pc-selbar"><span>已选 ${ui.picked.size} 个</span><button class="pc-pill dashed tiny" data-act="selall">全选</button>
+    ${ui.selecting ? `<div class="pc-selbar"><span>已选 ${ui.picked.size} 个</span><button class="pc-pill dashed tiny" data-act="selall">全选</button><button class="pc-pill dashed tiny" data-act="selempty">选没例图的</button>
       <button class="pc-pill dashed tiny" data-act="seltag" ${ui.picked.size ? '' : 'disabled'}>加标签</button>
       ${ui.bookTab === 'artists' ? `<button class="pc-pill dashed tiny danger" data-act="selban" ${ui.picked.size ? '' : 'disabled'}>拉黑</button>` : ''}
       <button class="pc-pill tiny danger-solid" data-act="seldel" ${ui.picked.size ? '' : 'disabled'}>删除</button></div>` : ''}
-    ${view === 'grid' ? `<div class="pc-grid2 pc-mt-s">${refs.map(r => ticketCard(d, r)).join('') || emptyTxt}</div>`
-        : `<div class="pc-mt-s">${refs.map(r => listCard(d, r)).join('') || emptyTxt}</div>`}
+    ${(() => {
+        const n = Math.max(40, Number(ui.bookShow) || 40), shown = refs.slice(0, n);
+        return (view === 'grid' ? `<div class="pc-grid2 pc-mt-s">${shown.map(r => ticketCard(d, r)).join('') || emptyTxt}</div>`
+            : `<div class="pc-mt-s">${shown.map(r => listCard(d, r)).join('') || emptyTxt}</div>`)
+            + (refs.length > n ? `<div class="pc-center pc-mt-s"><button class="pc-pill dashed" id="pc-bookmore" data-act="bookmore">再显示 ${Math.min(40, refs.length - n)} 个 · 共 ${refs.length} 个</button></div>`
+                : (refs.length > 40 ? `<div class="pc-dim small pc-center pc-mt-s">全部 ${refs.length} 个都在这里了</div>` : ''));
+    })()}
     <div class="pc-center pc-mt"><button class="pc-pill dashed" data-act="nav" data-view="batch">批量生成例图</button></div>
     <div style="height:24px"></div>`;
 }
@@ -5084,6 +5432,30 @@ function chosenTemplates(scope) {
     return rs.flatMap(r => ss.map(sh => `${r}_${sh}`)).filter(id => getData().templates[id]);
 }
 
+function pcParamCard(ref, it) {
+    const s = N.settings(), at = `data-tparam="${ref.type}:${ref.id}"`, v = k => esc(String(it[k] ?? ''));
+    const nameOf = (list, x) => (list.find(m => m[0] === x) || [x, x])[1];
+    const set = [
+        it.model && nameOf(N.MODELS, it.model),
+        it.sampler && nameOf(N.SAMPLERS, it.sampler),
+        String(it.steps ?? '').trim() && it.steps + ' 步',
+        String(it.cfg ?? '').trim() && 'CFG ' + it.cfg,
+        String(it.rescale ?? '').trim() && 'Rescale ' + it.rescale,
+        it.schedule,
+    ].filter(Boolean);
+    return `<section class="pc-card pc-pad pc-mt"><details class="pc-fold" ${set.length ? 'open' : ''}><summary><b>出图参数</b><i>${esc(set.length ? set.join(' · ') : '跟设置走')}</i></summary><div class="pc-fold-in">
+      <div class="pc-hint" style="margin-top:0">用这串出图时自动套用这些参数（正文插图、例图、生图页都算），不改全局设置。留空则跟全局设置走。</div>
+      <label class="pc-field pc-mt-s"><span>模型</span><select class="pc-input" ${at} data-field="model"><option value="">跟设置（${esc(nameOf(N.MODELS, s.novelaimode))}）</option>${N.MODELS.map(([m, t]) => `<option value="${m}" ${it.model === m ? 'selected' : ''}>${esc(t)}</option>`).join('')}</select></label>
+      <div class="pc-grid2 pc-mt-s" style="gap:8px">
+        <label class="pc-field"><span>采样器</span><select class="pc-input" ${at} data-field="sampler"><option value="">跟设置（${esc(nameOf(N.SAMPLERS, s.novelai_sampler))}）</option>${N.SAMPLERS.map(([m, t]) => `<option value="${m}" ${it.sampler === m ? 'selected' : ''}>${esc(t)}</option>`).join('')}</select></label>
+        <label class="pc-field"><span>噪声表</span><select class="pc-input" ${at} data-field="schedule"><option value="">跟设置（${esc(s.Schedule || 'karras')}）</option>${N.SCHEDULES.map(([m, t]) => `<option value="${m}" ${it.schedule === m ? 'selected' : ''}>${esc(t)}</option>`).join('')}</select></label>
+        <label class="pc-field"><span>步数</span><input class="pc-input" type="number" min="1" max="50" ${at} data-field="steps" value="${v('steps')}" placeholder="${esc(String(s.novelai_steps))}"></label>
+        <label class="pc-field"><span>CFG</span><input class="pc-input" type="number" min="0" max="30" step="0.1" ${at} data-field="cfg" value="${v('cfg')}" placeholder="${esc(String(s.nai3Scale))}"></label>
+        <label class="pc-field"><span>Rescale</span><input class="pc-input" type="number" min="0" max="1" step="0.02" ${at} data-field="rescale" value="${v('rescale')}" placeholder="${esc(String(s.cfg_rescale))}"></label>
+      </div>
+      <div class="pc-actions wrap pc-mt-s"><button class="pc-pill dashed tiny" data-act="tparamnow" data-tp="${ref.type}:${ref.id}">填入当前设置</button>${set.length ? `<button class="pc-pill dashed tiny" data-act="tparamclear" data-tp="${ref.type}:${ref.id}">全部清空</button>` : ''}</div>
+    </div></details></section>`;
+}
 function viewArtist(d) {
     const a = d.artists[ui.detailId];
     if (!a) { ui.view = 'book'; return viewBook(d); }
@@ -5102,6 +5474,7 @@ function viewArtist(d) {
       <b class="pc-block pc-mt-s">备注</b>
       <textarea class="pc-textarea small" data-bind-artist="${a.id}" placeholder="适合什么题材、权重心得…">${esc(a.note)}</textarea>
     </section>
+    ${pcParamCard(ref, a)}
     <section class="pc-card pc-pad pc-mt">
       <b>在哪些画师组里</b>
       <div class="pc-chips wrap">${groups.map(g => `<button class="pc-pill gold" data-act="open" data-type="group" data-id="${g.id}">${esc(g.name)} ›</button>`).join('') || '<span class="pc-dim">还不在任何画师组里</span>'}</div>
@@ -5129,6 +5502,7 @@ function viewGroup(d) {
       <b class="pc-block pc-mt-s">备注</b>
       <textarea class="pc-textarea small" data-bind-group="${g.id}" data-field="note" placeholder="适合什么题材、配哪个氛围…">${esc(g.note)}</textarea>
     </section>
+    ${pcParamCard(ref, g)}
     <section class="pc-card pc-pad pc-mt">
       <div class="pc-row-between"><b>组里的画师 · ${g.members.length}</b><button class="pc-pill dashed tiny" data-act="addmember" data-id="${g.id}">＋ 加画师</button></div>
       ${g.members.map((m, i) => memberRow(d, g, m, i)).join('')}
@@ -6585,8 +6959,10 @@ async function onClick(ev, outside = false) {
                 root.querySelector('.pc-body')?.scrollTo(0, 0);
                 break;
             case 'back': ui.view = ui.backTo || 'book'; render(); break;
-            case 'booktab': ui.bookTab = el.dataset.tab; ui.picked.clear(); render(); break;
-            case 'bookfilter': ui.bookFilter = el.dataset.f; render(); break;
+            case 'booktab': ui.bookTab = el.dataset.tab; ui.picked.clear(); ui.bookShow = 40; render(); break;
+            case 'bookfilter': ui.bookFilter = el.dataset.f; ui.bookShow = 40; render(); break;
+            case 'bookmore': ui.bookShow = Math.max(40, Number(ui.bookShow) || 40) + 40; render(); break;
+            case 'selempty': { bookList(d).forEach(r => { if (!(itemOf(d, r)?.images || []).length) ui.picked.add(r.id); }); render(); break; }
             case 'open': {
                 ev.stopPropagation();
                 const r = refFrom(el);
@@ -6622,6 +6998,23 @@ async function onClick(ev, outside = false) {
                 break;
             }
             case 'refreshquota': void refreshQuota(true); break;
+            case 'tparamnow': case 'tparamclear': {
+                const [t, id] = String(el.dataset.tp || '').split(':'), it = (t === 'group' ? d.groups : d.artists)[id];
+                if (!it) break;
+                if (act === 'tparamclear') {
+                    for (const k of [...TICKET_PARAM_KEYS, 'model']) delete it[k];
+                    commit(); toastr.info('已清空，这串出图跟设置走', '智库', { timeOut: 2000 });
+                    break;
+                }
+                const s = N.settings();
+                const put = (k, val) => { if (val != null && String(val).trim() !== '') it[k] = String(val); };
+                if (s.novelaimode && N.MODELS.some(m => m[0] === s.novelaimode)) it.model = s.novelaimode;
+                if (N.SAMPLERS.some(m => m[0] === s.novelai_sampler)) put('sampler', s.novelai_sampler);
+                if (N.SCHEDULES.some(m => m[0] === s.Schedule)) put('schedule', s.Schedule);
+                put('steps', s.novelai_steps); put('cfg', s.nai3Scale); if (s.cfg_rescale != null) put('rescale', s.cfg_rescale);
+                commit(); toastr.success('已填入当前设置，可以继续微调', '智库', { timeOut: 2000 });
+                break;
+            }
             case 'clearresult': ui.studio.result = null; ui.studio.sent = null; render(); break;
             case 'ucp-saveas': {
                 const ns = N.settings();
@@ -6772,13 +7165,12 @@ async function onClick(ev, outside = false) {
                 const r = refFrom(el);
                 const name = M.ticketName(d, r);
                 if (!(await confirmBox(r.type === 'group' ? `删除画师组「${name}」？组里的画师和他们的例图不会被删。` : `删除画师「${name}」？他的例图会一起删掉，也会从所有画师组里移出。`))) break;
-                const t = M.resolveTicket(d, r);
-                const imgs = t.item.images.slice();
+                const pcTids = pcTrashPut(d, [r]);
                 if (r.type === 'group') M.deleteGroup(d, r.id); else M.deleteArtist(d, r.id);
                 if (['artist', 'group'].includes(ui.view)) ui.view = 'book';
                 DOC.querySelector('.pc-sheet-backdrop')?.remove();
                 commit();
-                imgs.forEach(i => deleteImageFile(i.path));
+                pcUndoDelete(pcTids, `「${name}」`);
                 break;
             }
             case 'viewimg': {
@@ -6908,20 +7300,48 @@ async function onClick(ev, outside = false) {
             }
             // 氛围
             // 大堂
+            case 'trashrestore': case 'trashrestoreall': {
+                const tids = act === 'trashrestoreall' ? pcTrash(d).map(e => e.tid) : [el.dataset.t];
+                const n = pcTrashRestore(d, tids);
+                if (!pcTrash(d).length) ui.bookTab = 'artists';
+                commit(); render();
+                toastr.success(`放回了 ${n} 个`, '智库', { timeOut: 1800 });
+                break;
+            }
+            case 'trashpurge': case 'trashempty': {
+                const tids = act === 'trashempty' ? pcTrash(d).map(e => e.tid) : [el.dataset.t];
+                if (!tids.length) break;
+                if (!(await confirmBox(act === 'trashempty' ? `清空回收站？${tids.length} 个会彻底删掉，例图也一起删，不能再放回。` : '彻底删掉？例图也一起删，不能再放回。', { ok: '彻底删', cancel: '算了' }))) break;
+                pcTrashPurge(d, tids);
+                if (!pcTrash(d).length) ui.bookTab = 'artists';
+                commit(); render();
+                break;
+            }
             case 'selmode': ui.selecting = !ui.selecting; ui.picked.clear(); render(); break;
-            case 'selpick': { const id = el.dataset.id; if (ui.picked.has(id)) ui.picked.delete(id); else ui.picked.add(id); render(); break; }
+            case 'selpick': {
+                const id = el.dataset.id;
+                if (ui.picked.has(id)) ui.picked.delete(id); else ui.picked.add(id);
+                const on = ui.picked.has(id);
+                root.querySelectorAll('.pc-selbox').forEach(b => { if ((b.dataset.id || b.closest('[data-id]')?.dataset.id) === id) { b.classList.toggle('on', on); b.textContent = on ? '✓' : ''; } });
+                const bar = root.querySelector('.pc-selbar');
+                if (bar) {
+                    const sp = bar.querySelector('span');
+                    if (sp) sp.textContent = `已选 ${ui.picked.size} 个`;
+                    bar.querySelectorAll('[data-act="seltag"],[data-act="selban"],[data-act="seldel"]').forEach(x => { x.disabled = !ui.picked.size; });
+                }
+                break;
+            }
             case 'selall': { const refs = bookList(d); if (ui.picked.size === refs.length) ui.picked.clear(); else refs.forEach(r => ui.picked.add(r.id)); render(); break; }
             case 'seldel': {
                 const type = ui.bookTab === 'groups' ? 'group' : 'artist';
                 const ids = [...ui.picked].filter(id => itemOf(d, { type, id }));
                 if (!ids.length) break;
                 if (!(await confirmBox(type === 'group' ? `删除选中的 ${ids.length} 个画师组？组里的画师不会被删。` : `删除选中的 ${ids.length} 位画师？他们的例图会一起删掉，也会从所有画师组里移出。`, { ok: '删除', cancel: '算了' }))) break;
-                const imgs = ids.flatMap(id => itemOf(d, { type, id }).images.map(i => i.path));
+                const pcTids = pcTrashPut(d, ids.map(id => ({ type, id })));
                 for (const id of ids) { if (type === 'group') M.deleteGroup(d, id); else M.deleteArtist(d, id); }
                 ui.picked.clear(); ui.selecting = false;
                 commit();
-                imgs.forEach(p => deleteImageFile(p));
-                toastr.success(`删掉了 ${ids.length} 个`, '智库');
+                pcUndoDelete(pcTids, `${ids.length} 个`);
                 break;
             }
             case 'selban': {
@@ -7088,7 +7508,7 @@ function onInput(ev) {
         if (el.dataset.bind === 'batch.text') { const w = root.querySelector('#pc-batch-ban'); if (w) w.innerHTML = batchBanWarn(getData(), el.value); }
         if (['studio.pos', 'studio.neg', 'studio.scene', 'studio.sceneEn'].includes(el.dataset.bind)) { updateStudioPreview(); clearTimeout(onInput.ss); onInput.ss = setTimeout(saveStudio, 600); }
         if (el.dataset.bind === 'studio.scene') { const box = root.querySelector('#pc-scene-ai'); if (box) box.hidden = !sceneZh(); const s2 = root.querySelector('#pc-scene-state'); if (s2) s2.textContent = sceneStateText(); }
-        if (el.dataset.bind === 'search') { clearTimeout(onInput.t); onInput.t = setTimeout(() => { render(); const i = root.querySelector('[data-bind="search"]'); if (i) { i.focus(); i.setSelectionRange(i.value.length, i.value.length); } }, 250); }
+        if (el.dataset.bind === 'search') { ui.bookShow = 40; clearTimeout(onInput.t); onInput.t = setTimeout(() => { render(); const i = root.querySelector('[data-bind="search"]'); if (i) { i.focus(); i.setSelectionRange(i.value.length, i.value.length); } }, 250); }
         return;
     }
     if (el.dataset.bindArtist) { d.artists[el.dataset.bindArtist].note = el.value; commit({ silent: true }); return; }
@@ -7101,6 +7521,11 @@ function onInput(ev) {
     if (el.dataset.charaliases !== undefined) { const c = C.getChar(ui.charKey); if (c) { c.aliases = splitAliases(el.value); C.saveChar(c); } return; }
     if (el.dataset.charnl !== undefined) { const c = C.getChar(ui.charKey); if (c) { c.nl = el.value.trim(); C.saveChar(c); } return; }
     if (el.dataset.charneg !== undefined) { const c = C.getChar(ui.charKey); if (c) { c.negative = el.value; C.saveChar(c); } return; }
+    if (el.dataset.tparam) {
+        const [t, id] = el.dataset.tparam.split(':'), it = (t === 'group' ? d.groups : d.artists)[id], k = el.dataset.field;
+        if (it && k) { const val = String(el.value ?? '').trim(); if (val === '') delete it[k]; else it[k] = val; commit({ silent: el.tagName !== 'SELECT' }); }
+        return;
+    }
     if (el.dataset.bindGroup) { d.groups[el.dataset.bindGroup][el.dataset.field] = el.value; commit({ silent: true }); return; }
     if (el.dataset.crstr !== undefined) {
         const [gid, i] = el.dataset.crstr.split(':');
@@ -7119,7 +7544,7 @@ async function onChangeEv(ev) {
     const d = getData();
     if (el.dataset.sceneOn !== undefined) { ui.studio.sceneOn = el.checked; saveStudio(); render(); return; }
     if (el.dataset.bindCheck === 'studio.sceneExpand') { ui.studio.sceneExpand = el.checked; saveStudio(); }
-    if (el.dataset.bindGroup || el.dataset.bindArtist) { commit(); return; }
+    if (el.dataset.bindGroup || el.dataset.bindArtist || el.dataset.tparam) { commit(); return; }
     if (el.dataset.cast) { C.setCastOn(el.dataset.cast, el.checked); render(); return; }
     if (el.dataset.crtype) { const [g, i] = el.dataset.crtype.split(':'); d.charRefGroups[g].refs[Number(i)].type = el.value; commit({ silent: true }); return; }
     if (el.dataset.wardimg !== undefined || el.dataset.outimg !== undefined) {
@@ -7219,6 +7644,7 @@ async function onChangeEv(ev) {
     if (el.dataset.stCheck) {
         N.settings()[el.dataset.stCheck] = el.checked ? 'true' : 'false';
         N.save();
+        if (el.dataset.stCheck === 'v5Chinese') render();
         return;
     }
     if (el.dataset.bindCheck) { setPath(ui, el.dataset.bindCheck, el.checked); if (ui.view === 'batch') render(); return; }
@@ -7266,7 +7692,7 @@ async function doGenerate() {
     const st = ui.studio;
     if (!N.isReady()) { toastr.warning('先到设置里填 NovelAI key', '生成图片'); ui.view = 'settings'; render(); return; }
     if (!st.pos.trim()) { toastr.warning('正面提示词是空的', '生成图片'); return; }
-    if (T.hasChinese(st.pos.replace(/（[^（）]*）/g, ''))) {
+    if (!pcV5Zh() && T.hasChinese(st.pos.replace(/（[^（）]*）/g, ''))) {
         if (!(await confirmBox('正面提示词里有中文，NovelAI 看不懂中文。还是要生成吗？（中文描述可以写进下面的「固定提示词」，会自动转成标签）', { ok: '照样生成', cancel: '先不' }))) return;
     }
     if (st.sceneOn !== false && String(st.scene || '').trim() && !sceneReady()) {
@@ -7775,13 +8201,32 @@ function openSwitcher({ onPick } = {}) {
     pcMount(back);
     let picked = d.active;
     const charName = E.currentCharacterName();
-    const draw = () => {
+    let query = '';
+    const refsNow = () => {
+        const q = query.trim().toLowerCase();
+        if (q) {
+            const all = [
+                ...Object.values(d.groups).sort((a, b) => (b.usedAt || b.createdAt || 0) - (a.usedAt || a.createdAt || 0)).map(g => ({ type: 'group', id: g.id })),
+                ...Object.values(d.artists).map(a => ({ type: 'artist', id: a.id })),
+            ];
+            return all.filter(r => {
+                try { return (M.ticketName(d, r) + '\n' + M.ticketString(d, r)).toLowerCase().replace(/_/g, ' ').includes(q.replace(/_/g, ' ')); }
+                catch { return false; }
+            }).slice(0, 200);
+        }
         let refs = [];
         if (sheetFilter === 'recent') refs = d.recent.filter(r => M.resolveTicket(d, r));
         else if (sheetFilter === 'fav') refs = Object.values(d.groups).filter(g => g.fav).map(g => ({ type: 'group', id: g.id }));
         else if (sheetFilter === 'artists') refs = Object.values(d.artists).map(a => ({ type: 'artist', id: a.id }));
         else if (sheetFilter === 'groups') refs = Object.values(d.groups).sort((a, b) => (b.usedAt || b.createdAt) - (a.usedAt || a.createdAt)).map(g => ({ type: 'group', id: g.id }));
         else refs = Object.values(d.groups).filter(g => g.collections.includes(sheetFilter)).map(g => ({ type: 'group', id: g.id }));
+        return refs;
+    };
+    const listHtml = refs => `<div class="pc-hscroll">${refs.map(r => { const c = M.ticketCover(d, r); return `<button class="pc-mini-stub ${M.sameRef(r, picked) ? 'picked' : ''} ${M.sameRef(r, d.active) ? 'active' : ''}" data-s="pick" ${refAttr(r)}>
+              <span class="pc-mini-img">${c ? `<img src="${esc(imgUrl(c))}" alt="">` : ''}</span>
+              <b>${esc(M.ticketName(d, r))}</b><small>${r.type === 'group' ? `${d.groups[r.id].members.length} 位画师` : '单个画师'}</small></button>`; }).join('') || `<div class="pc-dim">${query.trim() ? '没搜到，换个词试试' : '这里还没有画师串'}</div>`}</div>`;
+    const draw = () => {
+        const refs = refsNow();
         const bound = E.boundTicketForCurrent();
         const filters = [['recent', '最近用过'], ['fav', '收藏'], ['groups', '全部画师组'], ['artists', '单个画师'], ...Object.values(d.collections).map(c => [c.id, c.name])];
         back.innerHTML = `<section class="pc-sheet" role="dialog" aria-label="切换画师串">
@@ -7791,9 +8236,8 @@ function openSwitcher({ onPick } = {}) {
           <div class="pc-current">${seal('在用')}<div class="pc-grow"><b>${d.active ? esc(M.ticketName(d, d.active)) : '没用画师串'}</b><small>${d.active ? esc(M.ticketString(d, d.active)) : '用的是固定提示词里原来的画师'}</small></div>
             ${d.active ? '<button class="pc-pill dashed" data-s="none">不用画师串</button>' : ''}</div>
           <div class="pc-chips">${filters.map(([k, t]) => `<button class="pc-pill ${sheetFilter === k ? 'on' : 'dashed'}" data-s="filter" data-f="${esc(k)}">${esc(t)}</button>`).join('')}</div>
-          <div class="pc-hscroll">${refs.map(r => { const c = M.ticketCover(d, r); return `<button class="pc-mini-stub ${M.sameRef(r, picked) ? 'picked' : ''} ${M.sameRef(r, d.active) ? 'active' : ''}" data-s="pick" ${refAttr(r)}>
-              <span class="pc-mini-img">${c ? `<img src="${esc(imgUrl(c))}" alt="">` : ''}</span>
-              <b>${esc(M.ticketName(d, r))}</b><small>${r.type === 'group' ? `${d.groups[r.id].members.length} 位画师` : '单个画师'}</small></button>`; }).join('') || '<div class="pc-dim">这里还没有画师串</div>'}</div>
+          <input class="pc-input" data-s-q value="${esc(query)}" placeholder="搜画师串名字或画师" style="margin-top:10px;width:100%" autocomplete="off">
+          ${listHtml(refs)}
           ${charName ? `<label class="pc-switch"><input type="checkbox" data-s-check="bind" ${bound ? 'checked' : ''}><span></span>绑定到角色卡「${esc(charName)}」<small>以后打开这个角色卡，自动用这个画师串</small></label>` : ''}
           <label class="pc-switch"><input type="checkbox" data-s-check="rotate" ${d.rotate !== 'off' ? 'checked' : ''}><span></span>每生成一张就换一个<small>从收藏（没有就从最近用过）里随机换</small></label>
           <label class="pc-switch"><input type="checkbox" data-s-check="once" ${d.oneShot ? 'checked' : ''}><span></span>只用一次<small>生成一张后，自动换回原来的画师串</small></label>
@@ -7808,8 +8252,8 @@ function openSwitcher({ onPick } = {}) {
         if (!el) return;
         const s = el.dataset.s;
         if (s === 'close') back.remove();
-        if (s === 'filter') { sheetFilter = el.dataset.f; draw(); }
-        if (s === 'pick') { picked = refFrom(el); draw(); }
+        if (s === 'filter') { sheetFilter = el.dataset.f; query = ''; draw(); }
+        if (s === 'pick') { picked = refFrom(el); const box = back.querySelector('.pc-hscroll'), left = box?.scrollLeft || 0, top = box?.scrollTop || 0; draw(); const nb = back.querySelector('.pc-hscroll'); if (nb) { nb.scrollLeft = left; nb.scrollTop = top; } }
         if (s === 'none') { E.setActive(null); E.bindCurrentCharacter(null); back.remove(); }
         if (s === 'apply' && picked && onPick) { onPick(picked); back.remove(); return; }
         if (s === 'apply' && picked) {
@@ -7819,6 +8263,16 @@ function openSwitcher({ onPick } = {}) {
             back.remove();
         }
     });
+    const relist = () => {
+        const old = back.querySelector('.pc-hscroll');
+        if (!old) return;
+        const left = old.scrollLeft, top = old.scrollTop;
+        old.outerHTML = listHtml(refsNow());
+        const n = back.querySelector('.pc-hscroll');
+        if (n) { n.scrollLeft = left; n.scrollTop = top; }
+    };
+    back.addEventListener('input', ev => { if (!ev.target.matches?.('[data-s-q]')) return; query = ev.target.value; if (!ev.isComposing) relist(); });
+    back.addEventListener('compositionend', ev => { if (ev.target.matches?.('[data-s-q]')) { query = ev.target.value; relist(); } });
     back.addEventListener('change', ev => {
         const c = ev.target.dataset.sCheck;
         if (c === 'bind') { if (!ev.target.checked) E.bindCurrentCharacter(null); else if (picked) E.bindCurrentCharacter(picked); }

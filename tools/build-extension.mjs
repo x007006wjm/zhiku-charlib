@@ -3,10 +3,11 @@ import assert from 'node:assert/strict';
 import {applyMarkers} from './apply-markers.mjs';
 import {applyUxFixes} from './ux-fixes.mjs';
 import {applyCharLibrary} from './apply-char-lib.mjs';
+import {applyV1Upgrades} from './apply-v1-upgrades.mjs';
 import {fileURLToPath} from 'node:url';
 process.chdir(fileURLToPath(new URL('../', import.meta.url)));
 const dir='.';
-const VERSION='0.8.20';
+const VERSION='1.0.0';
 let s=applyMarkers(JSON.parse(fs.readFileSync('zhiku.script.json','utf8')).content);
 function patch(a,b){assert.equal(s.split(a).length,2,a.slice(0,80));s=s.replace(a,()=>b);}
 patch("globalThis.__PC_VERSION = '0.6.3';", `globalThis.__PC_VERSION = '${VERSION}';`);
@@ -198,7 +199,9 @@ s=applyUxFixes(s);
     const weightHelper = fs.readFileSync('src/weight-guard.js', 'utf8').replace(/^export\s+/gm, '');
     const prHelper = fs.readFileSync('src/precise-ref.js', 'utf8').replace(/^export\s+/gm, '');
     const quotaHelper = fs.readFileSync('src/quota.js', 'utf8').replace(/^export\s+/gm, '');
-    s = quotaHelper + '\n' + prHelper + '\n' + weightHelper + '\n' + ucpHelper + '\n' + s;
+    const streamFinalHelper = fs.readFileSync('src/stream-final.js', 'utf8').replace(/^export\s+/gm, '');
+    const ticketParamsHelper = fs.readFileSync('src/ticket-params.js', 'utf8').replace(/^export\s+/gm, '');
+    s = ticketParamsHelper + '\n' + streamFinalHelper + '\n' + quotaHelper + '\n' + prHelper + '\n' + weightHelper + '\n' + ucpHelper + '\n' + s;
     // 面板顶部剩余额度查询（官方 key / 酒馆 key / 第三方中转站通用）
     patch(`function anlasText(j) {`,
         `async function fetchQuota() {
@@ -656,6 +659,8 @@ return { serverBase, lobbyImgUrl, health, listPosts, listTags, createPost, updat
 }
 // 角色外观库：$名字$ 展开、别名、世界书宏 {{zhiku_characters}}、开关与界面提示
 s=applyCharLibrary(s);
+// v1.0.0 第一批上游高价值移植
+s=applyV1Upgrades(s);
 // TauriTavern / WebView 流畅度与事件逻辑优化：
 // 1) 去重启动时双倍 refresh()；2) 增量单楼层 decorate + 批量防抖 addMesButtons，消除 O(N^2) DOM 风暴；
 // 3) 串行化 applyCharacterBlocks -> process，避免并发 saveChat() 竞态；4) 切聊天防抖并立即清理流式预生成缓存。

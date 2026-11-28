@@ -5,15 +5,80 @@ export const MARKER_REGEX_ID = '72c57f73-46af-46ac-a28e-bf31b131332a';
 export const MARKER_DISPLAY_ID = '6ba93a8e-cabb-494c-a7e8-6c9dfcf5fb80';
 export const CHAR_BLOCK_DISPLAY_ID = 'a7c1d9b4-2f5e-4c6a-9d31-8b0f4e2a5c77';
 export const CHAR_BLOCK_RE_SOURCE = '[<＜](?:人物|外貌变化)[>＞][\\s\\S]*?[<＜][/／](?:人物|外貌变化)[>＞]';
+export function guardChatScroll(doc = globalThis.document) {
+    try {
+        const chat = doc?.getElementById?.('chat');
+        if (!chat || typeof chat.getBoundingClientRect !== 'function') return;
+        if (chat.scrollHeight - chat.scrollTop - chat.clientHeight < 8) return; // 本来就在最底下：不动
+        const top0 = chat.getBoundingClientRect().top;
+        const list = [...chat.querySelectorAll(':scope > .mes')];
+        const anchor = list.find(m => m.getBoundingClientRect().bottom > top0 + 10);
+        if (!anchor) return;
+        const mesid = anchor.getAttribute('mesid');
+        const off = anchor.getBoundingClientRect().top - top0;
+        const token = {};
+        guardChatScroll._cur = token;
+        let quit = false;
+        const stop = () => { quit = true; };
+        for (const ev of ['wheel', 'touchmove', 'keydown', 'mousedown']) {
+            chat.addEventListener(ev, stop, { passive: true, once: true });
+        }
+        const find = () => chat.querySelector(`:scope > .mes[mesid="${mesid}"]`);
+        const fix = () => {
+            if (quit || guardChatScroll._cur !== token) return;
+            const m = find();
+            if (!m) return;
+            const d = (m.getBoundingClientRect().top - chat.getBoundingClientRect().top) - off;
+            if (Math.abs(d) > 1) chat.scrollTop += d;
+        };
+        if (typeof globalThis.requestAnimationFrame === 'function') globalThis.requestAnimationFrame(fix);
+        for (const t of [0, 60, 300, 800, 1500, 2500, 4000]) setTimeout(fix, t);
+        let ro = null, mo = null;
+        try {
+            if (typeof globalThis.ResizeObserver === 'function') {
+                ro = new ResizeObserver(fix);
+                for (const m of chat.querySelectorAll(':scope > .mes')) ro.observe(m);
+            }
+        } catch { ro = null; }
+        try {
+            if (typeof globalThis.MutationObserver === 'function') {
+                mo = new MutationObserver(() => {
+                    fix();
+                    try { for (const m of chat.querySelectorAll(':scope > .mes')) ro?.observe(m); } catch {}
+                });
+                mo.observe(chat, { childList: true, subtree: true });
+            }
+        } catch { mo = null; }
+        setTimeout(() => {
+            ro?.disconnect();
+            mo?.disconnect();
+            if (guardChatScroll._cur === token) guardChatScroll._cur = null;
+        }, 5000);
+    } catch { /* 钉不住就算了，不影响改楼层 */ }
+}
 export function escapeMarker(value) { return value.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&'); }
 export function markerPattern(start, end) { return escapeMarker(start) + '[\\s\\S]*?' + escapeMarker(end); }
+export const THINK_BLOCK_RE = /<\s*(think[\w-]*|thoughts?|reasoning|reason|cot|inner[_-]?thoughts?|analysis|plann?ing|plans?|思考|思维链?|推理|规划)(?:\s[^>]*)?>[\s\S]*?(?:<\/\s*\1\s*>|$)/gi;
+export function markerSkipRanges(text) {
+    const t = String(text || ''), out = [];
+    for (const m of t.matchAll(THINK_BLOCK_RE)) out.push([m.index, m.index + m[0].length]);
+    for (const m of t.matchAll(/```[\s\S]*?(?:```|$)/g)) out.push([m.index, m.index + m[0].length]);
+    for (const m of t.matchAll(/`[^`\n]+`/g)) out.push([m.index, m.index + m[0].length]);
+    return out;
+}
+export function isPlaceholderPrompt(p) {
+    const t = String(p || '').replace(/[\s.。…·•_\-—~～,，、]+/g, '');
+    return !t || /^(x{2,}|tags?|prompts?|提示词|标签|内容|英文标签|英文提示词|tag内容)$/i.test(t);
+}
 export function parseImageMarkers(text, start, end) {
     if (!start || !end) return [];
-    const result=[];
+    const result=[], src=String(text || ''), skip=markerSkipRanges(src);
     const regex=new RegExp(escapeMarker(start)+'([\\s\\S]*?)'+escapeMarker(end),'g');
-    for (const m of String(text || '').matchAll(regex)) {
+    for (const m of src.matchAll(regex)) {
         const prompt=m[1].trim();
-        if (prompt) result.push({raw:m[0],prompt,index:m.index});
+        if (!prompt || isPlaceholderPrompt(prompt)) continue;
+        if (skip.some(([a, b]) => m.index >= a && m.index < b)) continue;
+        result.push({raw:m[0],prompt,index:m.index});
     }
     return result;
 }
@@ -141,13 +206,13 @@ export function createMarkerController({context,getData,generate,upload,notify,e
     const pregenSeen=new Set();
     function pregenSlot(chat,floor,msg,token){return chat+'|'+floor+'|'+recordKey(msg,token);}
     function pregenSeenKey(chat,token){return chat+'|'+String(token?.prompt||'');}
-    /** 剥离推理模型的 <think>/<thinking>/<thought> 思考过程，避免误预生成思考草稿里的标记。 */
+    /** 剥离推理模型的思考与规划块（<think_xxx>/<thinking>/<thought>/<reasoning>/<plan>/<planning>/<思考> 等），避免误预生成思考草稿里的标记。 */
     function stripThinking(text){
         if(!text||typeof text!=='string')return '';
-        let cleaned=text.replace(/<\s*(?:think(?:ing)?|thought)(?:\s+[^>]*)?>[\s\S]*?<\/\s*(?:think(?:ing)?|thought)\s*>/gi,'');
-        const closeMatch=cleaned.match(/<\/\s*(?:think(?:ing)?|thought)\s*>/i);
+        let cleaned=text.replace(/<\s*(think[\w-]*|thoughts?|reasoning|reason|cot|inner[_-]?thoughts?|analysis|plann?ing|plans?|思考|思维链?|推理|规划)(?:\s[^>]*)?>[\s\S]*?<\/\s*\1\s*>/gi,'');
+        const closeMatch=cleaned.match(/<\/\s*(?:think[\w-]*|thoughts?|reasoning|reason|cot|inner[_-]?thoughts?|analysis|plann?ing|plans?|思考|思维链?|推理|规划)\s*>/i);
         if(closeMatch&&closeMatch.index!==undefined)cleaned=cleaned.slice(closeMatch.index+closeMatch[0].length);
-        const openMatch=cleaned.match(/<\s*(?:think(?:ing)?|thought)(?:\s+[^>]*)?>/i);
+        const openMatch=cleaned.match(/<\s*(?:think[\w-]*|thoughts?|reasoning|reason|cot|inner[_-]?thoughts?|analysis|plann?ing|plans?|思考|思维链?|推理|规划)(?:\s[^>]*)?>/i);
         if(openMatch&&openMatch.index!==undefined)cleaned=cleaned.slice(0,openMatch.index);
         return cleaned;
     }
@@ -384,7 +449,7 @@ export function createMarkerController({context,getData,generate,upload,notify,e
                 const next=source.slice(0,tag.index)+raw+source.slice(tag.index+tag[0].length);
                 const swipes=Array.isArray(msg.swipes)&&Number.isInteger(swipe)?msg.swipes:null,oldSwipe=swipes?.[swipe];
                 msg.mes=next;if(swipes)swipes[swipe]=next;
-                try {await context().saveChat();context().updateMessageBlock(id,msg);decorate(id);}
+                try {await context().saveChat();guardChatScroll(doc);context().updateMessageBlock(id,msg);decorate(id);}
                 catch(e){msg.mes=source;if(swipes)swipes[swipe]=oldSwipe;notify(e.message||String(e),'error');}
             };
             img.addEventListener('contextmenu',e=>{e.preventDefault();bar.hidden=false;remove.focus();});
