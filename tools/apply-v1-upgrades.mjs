@@ -181,6 +181,9 @@ export function applyV1Upgrades(s) {
     }
     if (!outList.length) throw new Error('压缩包里没有图片');
     return outList;
+}
+async function unzipFirstImage(u8) {
+    return pickFinalImageFrame(await unzipAllImages(u8));
 }`
     );
 

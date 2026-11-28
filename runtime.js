@@ -865,7 +865,7 @@ function deleteUcpPreset(presets, id) {
     return normalizeUcpPresets(presets).filter(p => p.id !== target);
 }
 
-// 智库 · 原生扩展版 v1.0.3（二改自从前佬的智绘姬）
+// 智库 · 原生扩展版 v1.0.4（二改自从前佬的智绘姬）
 // 不需要智绘姬，填 NovelAI key 就能用。
 // NovelAI 请求格式参考了智绘姬（作者：从前跟你一样，https://github.com/damoshen123/st-chatu8，AFPL v9）。
 const P = (() => { try { if (window.parent && window.parent !== window && window.parent.document) return window.parent; } catch (e) { /* 跨域 */ } return window; })();
@@ -883,7 +883,7 @@ const __shim = {
     get extension_settings() { return __ctx().extensionSettings; },
 };
 
-globalThis.__PC_VERSION = '1.0.3';
+globalThis.__PC_VERSION = '1.0.4';
 
 // ───── model.js ─────
 const __mod_model = (() => {
@@ -2071,6 +2071,9 @@ async function unzipAllImages(u8) {
     }
     if (!outList.length) throw new Error('压缩包里没有图片');
     return outList;
+}
+async function unzipFirstImage(u8) {
+    return pickFinalImageFrame(await unzipAllImages(u8));
 }
 
 // ───────────── 测试 key、查点数 ─────────────
