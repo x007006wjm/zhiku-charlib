@@ -34,7 +34,12 @@ export function applyMarkers(source) {
     DOC.head.appendChild(markerStyle);cleanups.push(()=>markerStyle.remove());`);
         if(!s.includes('pc-compact-image-style'))s=s.replace('    injectCss();', "    injectCss();\n    const compactStyle=DOC.createElement('style');compactStyle.id='pc-compact-image-style';compactStyle.textContent=\".mes_text .pc-marker-slot{display:flex;gap:8px;margin:6px 0;padding:4px 8px;border-radius:6px;width:fit-content;max-width:100%;font-size:12px;line-height:1.5}.mes_text .pc-marker-slot summary,.mes_text .pc-image-actions summary{font-size:12px;cursor:pointer}.mes_text .pc-marker-generate,.mes_text .pc-image-actions button{font-size:12px;line-height:1.5;padding:3px 8px;min-height:28px;width:auto;margin:0}.mes_text .pc-marker-slot pre,.mes_text .pc-image-actions pre{font:12px/1.5 sans-serif;white-space:pre-wrap;overflow-wrap:anywhere;max-height:140px;overflow:auto;scrollbar-width:none}.mes_text .pc-image-actions pre::-webkit-scrollbar{display:none}.mes_text .pc-chat-img{display:block;max-width:min(100%,360px);max-height:480px;object-fit:contain;cursor:zoom-in}.pc-image-actions{display:flex;align-items:start;gap:8px;flex-wrap:wrap;margin:4px 0 8px}.pc-image-actions details{max-width:100%}.pc-image-preview{position:fixed;inset:0;z-index:40000;background:rgba(0,0,0,.85);display:flex;align-items:center;justify-content:center}.pc-image-preview img{max-width:95vw;max-height:90vh;object-fit:contain}.pc-image-preview button{position:absolute;right:16px;top:16px;padding:8px 16px}\";DOC.head.append(compactStyle);cleanups.push(()=>compactStyle.remove());");
         const referenceCss=fs.readFileSync(new URL('../src/marker-ui.css',import.meta.url),'utf8').replace(/\r\n/g,'\n');
-        if(!s.includes('/* reference-marker-ui */'))s=s.replace('    DOC.head.appendChild(markerStyle);', '    /* reference-marker-ui */ markerStyle.textContent += '+JSON.stringify(referenceCss)+';\n    DOC.head.appendChild(markerStyle);');
+        const cssLine='    /* reference-marker-ui */ markerStyle.textContent += '+JSON.stringify(referenceCss)+';';
+        if(s.includes('/* reference-marker-ui */')) {
+            s=s.replace(/    \/\* reference-marker-ui \*\/ markerStyle\.textContent \+= [^\n]+;/, () => cssLine);
+        } else {
+            s=s.replace('    DOC.head.appendChild(markerStyle);', cssLine+'\n    DOC.head.appendChild(markerStyle);');
+        }
         return s;
     }
     const logic=fs.readFileSync(new URL('../src/marker-generation.js',import.meta.url),'utf8').replace(/\r\n/g,'\n').replace(/^export /gm,'');

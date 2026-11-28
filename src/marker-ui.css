@@ -47,31 +47,31 @@
 .pc-lb-danger{border-color:rgba(240,90,90,.45);color:#ffb3b3}
 .pc-lb-close{background:rgba(74,144,217,.35);border-color:rgba(74,144,217,.65)}
 
-/* v1.0.1 极简图片卡片（方案 C：角标 ··· + 底部多版本小点 + 居中显示） */
-.mes_text .pc-marker-slot.pc-slot-c{display:block;width:auto;max-width:100%;margin:10px 0;padding:0;border:0;background:transparent;font-size:13px;line-height:1.5}
-.pc-slot-c .pc-c-hidden,.pc-slot-c [hidden]{display:none!important}
-.pc-slot-c>.pc-result-collapse{margin:0;padding:0;border:0;background:transparent}
-.pc-slot-c>.pc-result-collapse>summary{display:none!important}
-.pc-slot-c .pc-c-frame{position:relative;width:fit-content;max-width:100%;margin:0 auto;border-radius:10px;overflow:hidden;line-height:0}
-.pc-slot-c .pc-c-frame .pc-result-image{display:block;margin:0;max-width:100%;max-height:520px;object-fit:contain;cursor:zoom-in}
-.pc-slot-c button.pc-c-more{position:absolute;top:8px;right:8px;width:auto;height:auto;min-height:0;margin:0;padding:0 10px 4px;border:0;border-radius:7px;background:rgba(0,0,0,.48);color:#fff;font:15px/1.4 sans-serif;letter-spacing:.12em;cursor:pointer;box-shadow:none;opacity:.92}
-.pc-slot-c button.pc-c-more.on{background:rgba(0,0,0,.74);opacity:1}
-.pc-slot-c .pc-c-dots{position:absolute;left:0;right:0;bottom:8px;display:flex;justify-content:center;gap:6px;line-height:0}
-.pc-slot-c button.pc-c-dot{width:7px;height:7px;min-height:0;margin:0;padding:0;border:0;border-radius:4px;background:rgba(255,255,255,.5);cursor:pointer;box-shadow:none;transition:width .15s ease}
-.pc-slot-c button.pc-c-dot.on{width:18px;background:#fff}
-.pc-slot-c .pc-c-status{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);padding:4px 14px;border-radius:7px;background:rgba(0,0,0,.64);color:#fff;font:13px/1.6 sans-serif;white-space:nowrap}
-.pc-slot-c .pc-c-row{display:flex;align-items:center;justify-content:center;gap:8px;flex-wrap:wrap}
-.pc-slot-c .pc-c-title{opacity:.72}
-.mes_text .pc-marker-slot.pc-slot-c .pc-c-row .pc-marker-generate{width:auto;min-height:0;margin:0;padding:5px 14px;border:0;border-radius:8px;background:var(--SmartThemeBlurTintColor,rgba(128,128,128,.16));color:inherit;font:inherit;font-size:13px;line-height:1.5;box-shadow:none}
-.mes_text .pc-marker-slot.pc-slot-c .pc-c-row .pc-marker-generate:hover{background:rgba(128,128,128,.24)}
-.pc-slot-c .pc-c-row button.pc-c-more{position:static;background:rgba(128,128,128,.18);color:inherit}
-.pc-slot-c button.pc-c-folded{display:block;width:auto;min-height:0;margin:0 auto;padding:6px 14px;border:0;border-radius:8px;background:rgba(128,128,128,.13);color:inherit;font:inherit;font-size:13px;cursor:pointer;box-shadow:none}
-.pc-slot-c .pc-c-menu{max-width:min(100%,420px);margin:8px auto 0;padding:4px 0;border-radius:10px;background:var(--SmartThemeBlurTintColor,rgba(128,128,128,.12));overflow:hidden}
-.pc-slot-c button.pc-c-item{display:flex;justify-content:space-between;align-items:baseline;gap:12px;width:100%;min-height:0;margin:0;padding:9px 14px;border:0;border-radius:0;background:transparent;color:inherit;font:inherit;font-size:13.5px;text-align:left;cursor:pointer;box-shadow:none}
-.pc-slot-c button.pc-c-item:hover{background:rgba(128,128,128,.13)}
-.pc-slot-c button.pc-c-item:disabled{opacity:.45;cursor:default}
-.pc-slot-c button.pc-c-item small{font-size:12px;opacity:.6;text-align:right}
-.pc-slot-c button.pc-c-item.pc-c-del{color:#d9897e}
+/* v1.0.6 极简图片卡片（方案 C：角标 ··· + 底部多版本小点 + 居中显示 + 深浅主题自适应） */
+.mes_text .pc-marker-slot.pc-slot-c{display:block!important;width:auto!important;max-width:100%!important;margin:10px 0!important;padding:0!important;border:0!important;background:transparent!important;font-size:13px;line-height:1.5;text-shadow:none!important}
+.mes_text .pc-marker-slot.pc-slot-c .pc-c-hidden,.mes_text .pc-marker-slot.pc-slot-c [hidden]{display:none!important}
+.mes_text .pc-marker-slot.pc-slot-c>.pc-result-collapse{display:block;margin:0!important;padding:0!important;border:0!important;background:transparent!important}
+.mes_text .pc-marker-slot.pc-slot-c>.pc-result-collapse>summary{display:none!important}
+.mes_text .pc-marker-slot.pc-slot-c .pc-c-frame{position:relative;width:fit-content;max-width:100%;margin:0 auto;border-radius:10px;overflow:hidden;line-height:0}
+.mes_text .pc-marker-slot.pc-slot-c .pc-c-frame .pc-result-image{display:block;margin:0;max-width:100%;max-height:520px;object-fit:contain;cursor:zoom-in}
+.mes_text .pc-marker-slot.pc-slot-c button.pc-c-more{position:absolute;top:8px;right:8px;width:auto!important;height:auto!important;min-height:0!important;margin:0!important;padding:2px 10px 4px!important;border:0!important;border-radius:7px!important;background:rgba(0,0,0,.52)!important;color:#fff!important;font:15px/1.3 sans-serif!important;letter-spacing:.12em;cursor:pointer;box-shadow:none!important;opacity:.92;text-shadow:none!important}
+.mes_text .pc-marker-slot.pc-slot-c button.pc-c-more.on{background:rgba(0,0,0,.78)!important;opacity:1}
+.mes_text .pc-marker-slot.pc-slot-c .pc-c-dots{position:absolute;left:0;right:0;bottom:8px;display:flex;justify-content:center;gap:6px;line-height:0}
+.mes_text .pc-marker-slot.pc-slot-c button.pc-c-dot{width:7px!important;height:7px!important;min-height:0!important;margin:0!important;padding:0!important;border:0!important;border-radius:4px!important;background:rgba(255,255,255,.5)!important;cursor:pointer;box-shadow:none!important;transition:width .15s ease}
+.mes_text .pc-marker-slot.pc-slot-c button.pc-c-dot.on{width:18px!important;background:#fff!important}
+.mes_text .pc-marker-slot.pc-slot-c .pc-c-status{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);padding:4px 14px;border-radius:7px;background:rgba(0,0,0,.68);color:#fff;font:13px/1.6 sans-serif;white-space:nowrap}
+.mes_text .pc-marker-slot.pc-slot-c .pc-c-row{display:flex;align-items:center;justify-content:center;gap:8px;flex-wrap:wrap}
+.mes_text .pc-marker-slot.pc-slot-c .pc-c-title{opacity:.75}
+.mes_text .pc-marker-slot.pc-slot-c .pc-c-row .pc-marker-generate{width:auto!important;min-height:0!important;margin:0!important;padding:5px 14px!important;border:1px solid rgba(128,128,128,.3)!important;border-radius:8px!important;background:var(--SmartThemeBlurTintColor,rgba(128,128,128,.2))!important;color:var(--SmartThemeBodyColor,inherit)!important;font:inherit!important;font-size:13px!important;line-height:1.5!important;box-shadow:none!important}
+.mes_text .pc-marker-slot.pc-slot-c .pc-c-row .pc-marker-generate:hover{background:rgba(128,128,128,.32)!important}
+.mes_text .pc-marker-slot.pc-slot-c .pc-c-row button.pc-c-more{position:static!important;background:rgba(128,128,128,.22)!important;color:var(--SmartThemeBodyColor,inherit)!important}
+.mes_text .pc-marker-slot.pc-slot-c button.pc-c-folded{display:block;width:auto!important;min-height:0!important;margin:0 auto!important;padding:6px 14px!important;border:1px solid rgba(128,128,128,.25)!important;border-radius:8px!important;background:var(--SmartThemeBlurTintColor,rgba(128,128,128,.16))!important;color:var(--SmartThemeBodyColor,inherit)!important;font:inherit!important;font-size:13px!important;cursor:pointer;box-shadow:none!important;text-shadow:none!important}
+.mes_text .pc-marker-slot.pc-slot-c .pc-c-menu{max-width:min(100%,420px);margin:8px auto 0;padding:4px 0;border-radius:10px;border:1px solid rgba(128,128,128,.24);background:var(--SmartThemeBlurTintColor,rgba(24,26,34,.85));overflow:hidden}
+.mes_text .pc-marker-slot.pc-slot-c button.pc-c-item{display:flex!important;justify-content:space-between;align-items:baseline;gap:12px;width:100%!important;min-height:0!important;margin:0!important;padding:9px 14px!important;border:0!important;border-radius:0!important;background:transparent!important;color:var(--SmartThemeBodyColor,inherit)!important;font:inherit!important;font-size:13.5px!important;text-align:left!important;cursor:pointer;box-shadow:none!important;text-shadow:none!important}
+.mes_text .pc-marker-slot.pc-slot-c button.pc-c-item:hover{background:rgba(128,128,128,.18)!important}
+.mes_text .pc-marker-slot.pc-slot-c button.pc-c-item:disabled{opacity:.45;cursor:default}
+.mes_text .pc-marker-slot.pc-slot-c button.pc-c-item small{font-size:12px;opacity:.68;text-align:right;color:inherit}
+.mes_text .pc-marker-slot.pc-slot-c button.pc-c-item.pc-c-del{color:#e67e73!important}
 /* 纸页风格修改提示词面板 */
 .pc-image-preview .pc-image-dialog.pc-c-panel{display:flex;flex-direction:column;align-items:stretch;justify-content:flex-start;gap:0;position:relative;width:min(94vw,520px);max-height:calc(100dvh - 32px);padding:20px 20px 18px;border-radius:16px;background:var(--pc-paper,#f4efe4);color:var(--pc-ink,#3a2a22);font-family:var(--pc-font,serif);box-shadow:0 18px 50px rgba(0,0,0,.35);box-sizing:border-box}
 .pc-c-panel .pc-c-head{font-family:var(--pc-font-name,var(--pc-font,serif));font-size:19px;font-weight:600;letter-spacing:.04em;line-height:1.3;padding-right:56px}
