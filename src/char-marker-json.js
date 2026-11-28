@@ -261,6 +261,18 @@ export function buildMarkerBase(payload) {
 const CLOSE_FRAMING_RE = /^(?:close-up|upper body|portrait|face)$/i;
 const WIDE_FRAMING_RE = /^(?:full body|wide shot|medium shot|cowboy shot|lower body)$/i;
 const LOWER_OUTFIT_RE = /\b(?:shoes?|boots?|sneakers?|sandals?|heels?|high heels?|loafers?|slippers?|barefoot|footwear|socks?|knee highs?|thighhighs?|stockings?|pantyhose|tights|leggings|garter(?: straps?)?|skirts?|miniskirts?|pants|jeans|shorts|trousers|panties|underwear|anklets?|legwear)\b/i;
+const NSFW_PROMPT_RE = /(?:^|[\s,;|(])(?:nsfw|explicit|r18|r-18|rating:explicit|nude|completely nude|naked|topless|bottomless|nipples|pussy|penis|uncensored|sex|vaginal|anal|fellatio|paizuri|cum|creampie|pubic hair|areolae|genitals)(?=$|[\s,;|)])/i;
+const NUDE_PROMPT_RE = /(?:^|[\s,;|(])(?:nude|completely nude|naked|topless|bottomless|no clothes|undressed|unclothed)(?=$|[\s,;|)])/i;
+
+/** 判断提示词或描述是否属于 NSFW 画面（独立词匹配，不误伤 sfw）。 */
+export function isNsfwPrompt(text) {
+    return NSFW_PROMPT_RE.test(String(text ?? ''));
+}
+
+/** 判断提示词或描述是否要求裸体 / 无衣（用于跳过角色库固定衣服）。 */
+export function isNudePrompt(text) {
+    return NUDE_PROMPT_RE.test(String(text ?? ''));
+}
 
 /** 景别是否为特写 / 半身（不含全身/中景/远景）：用于过滤框外下半身/鞋袜固定服装。 */
 export function isCloseFraming(baseTag) {
@@ -302,17 +314,25 @@ export function buildMarkerPlan(payload, { lookup = () => null, expand = value =
     const baseTag = textOf(payload?.tag);
     const characters = [];
     const charRefs = [];
+    const baseIsNsfw = isNsfwPrompt(base);
+    const baseIsNude = isNudePrompt(base);
     for (const entry of payload?.characters || []) {
         const info = lookup(entry.name);
         let tag = expand(entry.tag || '');
+        const charContext = [tag, expand(entry.nl || '')].filter(Boolean).join(', ');
+        const charIsNsfw = baseIsNsfw || isNsfwPrompt(charContext);
+        const charIsNude = baseIsNude || isNudePrompt(charContext);
         let libraryTags = '';
         if (info) {
+            const nsfwBody = charIsNsfw && info.nsfwBody ? expand(info.nsfwBody) : '';
             if (info.appearanceTags !== undefined || info.outfitTags !== undefined) {
                 const app = info.appearanceTags ? expand(info.appearanceTags) : '';
-                const outfit = info.outfitTags ? filterOutfitForFraming(expand(info.outfitTags), baseTag) : '';
-                libraryTags = [app, outfit].filter(Boolean).join(', ');
+                const outfit = !charIsNude && info.outfitTags ? filterOutfitForFraming(expand(info.outfitTags), baseTag) : '';
+                libraryTags = [app, nsfwBody, outfit].filter(Boolean).join(', ');
             } else if (info.tags) {
-                libraryTags = expand(info.tags);
+                libraryTags = [expand(info.tags), nsfwBody].filter(Boolean).join(', ');
+            } else if (nsfwBody) {
+                libraryTags = nsfwBody;
             }
         }
         if (libraryTags) tag = injectLibraryTags(tag, libraryTags);

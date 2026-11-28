@@ -159,38 +159,90 @@ export function createMarkerController({context,getData,generate,upload,notify,e
             const token=tokens[index];if(!token)return;
             const key=recordKey(msg,token);
             const record=msg.extra?.zhikuImages?.[key];
-            const ready=token.raw+'|'+(record?.url||'');
+            const vsCount=Array.isArray(record?.versions)?record.versions.length:0;
+            const ready=token.raw+'|'+(record?.url||'')+'|'+vsCount;
             if(slot.dataset.pcReady===ready) {
                 const b=slot.querySelector('button');if(b){b.disabled=!!state(msg,token);b.textContent=label(msg,token,record);}
                 if(record?.url&&cfg.expand&&freshResults.delete(key)){
                     const w=slot.querySelector('.pc-result-collapse');
                     if(w){w.open=true;const h=w.querySelector('summary');if(h)h.textContent='图片 · 点击收起';}
                 }
+                slot._pcSync?.();
                 return;
             }
             slot.dataset.pcReady=ready;
             slot.replaceChildren();
-            const details=doc.createElement('details'),summary=doc.createElement('summary'),pre=doc.createElement('pre'),button=doc.createElement('button');
-            summary.textContent='图片提示词';pre.textContent=token.prompt;
-            details.append(summary,pre);button.type='button';button.className='pc-marker-generate';button.title='点击生成，长按编辑提示词';
+            const makeEl=(tag,cls,text)=>{const e=doc.createElement(tag);if(cls)e.className=cls;if(text!=null)e.textContent=text;if(tag==='button')e.type='button';return e;};
+            const button=makeEl('button','pc-marker-generate');button.title='点击生成，长按编辑提示词';
             button.disabled=!!state(msg,token);button.textContent=label(msg,token,record);
             button.addEventListener('click',ev=>{ev.preventDefault();ev.stopPropagation();if(button._pcHeld)return;void process(Number(id),{manual:true,tokenIndex:index});});
-            slot.append(details,button);
             const edit=()=>editPrompt(id,msg,token,index);
             bindHold(button,edit);
+            slot.classList.add('pc-slot-c');
+            const menu=makeEl('div','pc-c-menu');menu.hidden=true;
+            const more=makeEl('button','pc-c-more','···');more.title='更多：重画、修改提示词、删掉';
+            more.addEventListener('click',ev=>{ev.preventDefault();ev.stopPropagation();menu.hidden=!menu.hidden;more.classList.toggle('on',!menu.hidden);});
+            const menuItem=(text,hint,fn,cls)=>{const b=makeEl('button','pc-c-item'+(cls?' '+cls:'')),t=makeEl('span','',text),h=makeEl('small','',hint||'');b.append(t,h);b.addEventListener('click',ev=>{ev.preventDefault();ev.stopPropagation();if(!b.disabled)fn(b,t);});return b;};
+            const redo=menuItem(record?.url?'重画':'生成图片',record?.url?'同一段提示词再画一次':'',()=>{menu.hidden=true;more.classList.remove('on');void process(Number(id),{manual:true,tokenIndex:index});});
+            const editBtn=menuItem('修改提示词','查看或编辑提示词后重画',()=>{menu.hidden=true;more.classList.remove('on');edit();});
+            let armed=0;
+            const dropBtn=menuItem('删掉这张','连标记一起删',async(b,t)=>{
+                if(!armed){t.textContent='再点一次删掉';armed=setTimeout(()=>{armed=0;t.textContent='删掉这张';},3000);holds.add(armed);return;}
+                clearTimeout(armed);holds.delete(armed);armed=0;b.disabled=true;t.textContent='删除中…';
+                try{await deleteMarkerAndResult(Number(id),msg,token);}catch(e){notify(e?.message||String(e),'error');b.disabled=false;t.textContent='删掉这张';}
+            },'pc-c-del');
             if(record?.url){
-                const wrapper=doc.createElement('details');wrapper.className='pc-result-collapse';
-                const header=doc.createElement('summary');
-                const img=doc.createElement('img');img.src=record.url;img.className='pc-result-image';img.alt='生成图片';img.loading='lazy';img.decoding='async';
-                wrapper.append(header,img);slot.append(wrapper);
-                // 「生成后自动展开」：只对这次刚生成的那张生效，历史图片仍旧收起
-                const fresh=freshResults.delete(recordKey(msg,token)),autoOpen=cfg.expand&&fresh;
-                const syncHeader=()=>{header.textContent=wrapper.open?'图片 · 点击收起':'图片 · 点击展开';};
+                button.classList.add('pc-c-hidden');
+                const wrapper=makeEl('details','pc-result-collapse');
+                const header=makeEl('summary');
+                const frame=makeEl('div','pc-c-frame');
+                const status=makeEl('div','pc-c-status');status.hidden=true;
+                const img=makeEl('img','pc-result-image');img.src=record.url;img.alt='生成图片';img.loading='lazy';img.decoding='async';
+                frame.append(img,more,status);
+                const vs=Array.isArray(record.versions)?record.versions:[];
+                if(vs.length>1){
+                    const cur=Math.max(0,vs.findIndex(v=>v.url===record.url));
+                    const dots=makeEl('div','pc-c-dots');
+                    vs.forEach((v,vi)=>{
+                        const dot=makeEl('button','pc-c-dot'+(vi===cur?' on':''));
+                        dot.title=`第 ${vi+1}/${vs.length} 版`;
+                        dot.addEventListener('click',ev=>{ev.preventDefault();ev.stopPropagation();if(vi!==cur)void switchVersion(Number(id),msg,token,vi);});
+                        dots.append(dot);
+                    });
+                    frame.append(dots);
+                    let sx=null,sy=0;
+                    img.addEventListener('pointerdown',e=>{sx=e.clientX;sy=e.clientY;});
+                    img.addEventListener('pointerup',e=>{if(sx==null)return;const dx=e.clientX-sx,dy=e.clientY-sy;sx=null;if(Math.abs(dx)>40&&Math.abs(dx)>Math.abs(dy)*1.5){const to=cur+(dx<0?1:-1);if(vs[to]){img._pcHeld=true;setTimeout(()=>{img._pcHeld=false;},400);void switchVersion(Number(id),msg,token,to);}}});
+                }
+                wrapper.append(header,frame);
+                const folded=makeEl('button','pc-c-folded');
+                const foldItem=menuItem('收起图片','',()=>{wrapper.open=!wrapper.open;syncOpen();menu.hidden=true;more.classList.remove('on');});
+                const syncOpen=()=>{
+                    const isOpen=!!wrapper.open;
+                    header.textContent=isOpen?'图片 · 点击收起':'图片 · 点击展开';
+                    folded.hidden=isOpen;
+                    folded.textContent=vs.length>1?`图片已收起（${vs.length} 版） · 点开`:'图片已收起 · 点开';
+                    if(foldItem.firstChild)foldItem.firstChild.textContent=isOpen?'收起图片':'展开图片';
+                    if(!isOpen&&!menu.hidden){menu.hidden=true;more.classList.remove('on');}
+                };
+                folded.addEventListener('click',ev=>{ev.preventDefault();ev.stopPropagation();wrapper.open=true;syncOpen();});
+                const fresh=freshResults.delete(key),autoOpen=cfg.expand&&fresh;
                 if(autoOpen)wrapper.open=true;
-                syncHeader();wrapper.addEventListener('toggle',syncHeader);
+                syncOpen();
+                wrapper.addEventListener('toggle',syncOpen);
                 img.addEventListener('click',ev=>{ev.preventDefault();ev.stopPropagation();if(!img._pcHeld)preview(id,msg,token,index,record);});
                 bindHold(img,edit);
-                button.textContent=label(msg,token,record);
+                menu.append(redo,editBtn,foldItem,dropBtn);
+                slot.append(button,wrapper,folded,menu);
+                slot._pcSync=()=>{const busy=!!button.disabled;status.hidden=!busy;status.textContent=button.textContent;redo.disabled=editBtn.disabled=dropBtn.disabled=busy;syncOpen();};
+                slot._pcSync();
+            }else{
+                const row=makeEl('div','pc-c-row');
+                row.append(makeEl('span','pc-c-title','生图标记'),button,more);
+                menu.append(editBtn,dropBtn);
+                slot.append(row,menu);
+                slot._pcSync=()=>{editBtn.disabled=dropBtn.disabled=!!button.disabled;};
+                slot._pcSync();
             }
 
         });
@@ -304,6 +356,42 @@ export function createMarkerController({context,getData,generate,upload,notify,e
         try{await context().saveChat();}catch(e){records[key]=old;throw e;}
         decorate(id);
     }
+    async function switchVersion(id,msg,token,verIdx){
+        if(pending.has(msg))return;
+        if(context().chat?.[id]!==msg)return;
+        const records=msg.extra?.zhikuImages,key=recordKey(msg,token),rec=records?.[key];
+        const vs=Array.isArray(rec?.versions)?rec.versions:[];
+        const target=vs[verIdx];
+        if(!target?.url)return;
+        const prevUrl=rec.url,prevPrompt=rec.prompt;
+        rec.url=target.url;if(target.prompt!=null)rec.prompt=target.prompt;
+        freshResults.add(key);
+        try{await context().saveChat();}catch(e){freshResults.delete(key);rec.url=prevUrl;rec.prompt=prevPrompt;notify(e?.message||String(e),'error');return;}
+        decorate(id);
+    }
+    async function deleteMarkerAndResult(id,msg,token){
+        if(pending.has(msg))throw new Error('请等本楼生成结束');
+        if(context().chat?.[id]!==msg)throw new Error('聊天已变化，请重新操作');
+        const source=String(msg.mes||''),swipe=msg.swipe_id;
+        let cut=token.index;
+        if(source.slice(cut,cut+token.raw.length)!==token.raw)cut=source.indexOf(token.raw);
+        if(cut<0)throw new Error('找不到对应的生图标记');
+        const next=(source.slice(0,cut)+source.slice(cut+token.raw.length)).replace(/\n{3,}/g,'\n\n');
+        const swipes=Array.isArray(msg.swipes)&&Number.isInteger(swipe)?msg.swipes:null,oldSwipe=swipes?.[swipe];
+        const records=msg.extra?.zhikuImages,key=recordKey(msg,token),oldRec=records?.[key];
+        msg.mes=next;if(swipes)swipes[swipe]=next;
+        if(records&&oldRec)delete records[key];
+        try{
+            await context().saveChat();
+            guardChatScroll(doc);
+            context().updateMessageBlock(id,msg);
+            decorate(id);
+        }catch(e){
+            msg.mes=source;if(swipes)swipes[swipe]=oldSwipe;
+            if(records&&oldRec)records[key]=oldRec;
+            throw e;
+        }
+    }
     function openImageViewer(src, actions = []) {
         const back=doc.createElement('div'),stage=doc.createElement('div'),img=doc.createElement('img'),bar=doc.createElement('div');
         back.className='pc-image-preview pc-lightbox';
@@ -413,19 +501,29 @@ export function createMarkerController({context,getData,generate,upload,notify,e
         ]);
     }
     function editPrompt(id,msg,token,index){
-        const source=msg.mes,swipe=msg.swipe_id,{box,dismiss}=dialog(),input=doc.createElement('textarea'),send=doc.createElement('button'),remove=doc.createElement('button');
-        input.value=token.prompt;input.rows=6;send.type=remove.type='button';send.textContent='生成图片';remove.textContent='删除当前图片';
+        const source=msg.mes,swipe=msg.swipe_id,{box,dismiss}=dialog();
+        box.classList.add('pc-c-panel');
+        const close=box.firstChild;
+        if(close&&close.tagName==='BUTTON'){close.className='pc-c-close';close.textContent='收起';}
+        const mk=(tag,cls,text)=>{const e=doc.createElement(tag);if(cls)e.className=cls;if(text!=null)e.textContent=text;if(tag==='button')e.type='button';return e;};
+        const head=mk('div','pc-c-head','修改提示词');
+        const labelEl=mk('div','pc-c-label','提示词内容');
+        const input=doc.createElement('textarea');input.value=token.prompt;input.rows=6;input.spellcheck=false;
+        const record=msg.extra?.zhikuImages?.[recordKey(msg,token)];if(record?.prompt)input.value=record.prompt;
+        const send=mk('button','pc-c-btn','按这个出图');
+        const remove=mk('button','pc-c-btn danger','仅删图片');
         send.onclick=async()=>{
             if(pending.has(msg))return;
             if(context().chat?.[id]!==msg||msg.mes!==source||msg.swipe_id!==swipe){notify('消息已变化，请重新打开编辑','info');return;}
             const prompt=input.value.trim();if(!prompt)return;
-            // Keep the original marker and attach the edited prompt to the generated result.
             dismiss();await process(id,{manual:true,tokenIndex:index,promptOverride:prompt});
         };
-        const record=msg.extra?.zhikuImages?.[recordKey(msg,token)];if(record?.prompt)input.value=record.prompt;
-        remove.disabled=!record;
+        remove.disabled=!record?.url;
         remove.onclick=async()=>{try{await deleteResult(id,msg,token);dismiss();}catch(e){notify(e.message,'error');}};
-        box.append(input,send,remove);
+        const acts=mk('div','pc-c-actions');
+        if(record?.url)acts.append(remove);
+        acts.append(send);
+        box.append(head,labelEl,input,acts);
     }
     function decorateImages(id,msg,scope) {
         const imgs=scope?scope.querySelectorAll('img:is(.pc-chat-img,.custom-pc-chat-img)'):doc.querySelectorAll(`.mes[mesid="${Number(id)}"] .mes_text img:is(.pc-chat-img,.custom-pc-chat-img)`);
@@ -507,7 +605,9 @@ export function createMarkerController({context,getData,generate,upload,notify,e
                     const {url}=await upload(image,'marker_'+Date.now());if(!current())return 0;
                     if(!url)throw new Error('图片上传未返回地址');
                     const hadExtra=!!msg.extra;msg.extra ||= {};const hadRecords=!!msg.extra.zhikuImages,records=msg.extra.zhikuImages ||= {},old=records[key];
-                    freshResults.add(key);records[key]={url:String(url),prompt:recordPrompt};
+                    const prevVersions=Array.isArray(old?.versions)?old.versions.slice():(old?.url?[{url:old.url,prompt:old.prompt||'',at:0}]:[]);
+                    const nextVersions=[...prevVersions.filter(v=>v?.url&&v.url!==String(url)),{url:String(url),prompt:recordPrompt,at:Date.now()}].slice(-10);
+                    freshResults.add(key);records[key]={url:String(url),prompt:recordPrompt,versions:nextVersions};
                     try{await c.saveChat();}catch(e){freshResults.delete(key);if(old)records[key]=old;else delete records[key];if(!hadRecords&&!Object.keys(records).length)delete msg.extra.zhikuImages;if(!hadExtra&&!Object.keys(msg.extra).length)delete msg.extra;throw e;}
                     failed.get(msg)?.delete(key);
                     notify(reuse?'已插入流式预生成图片':'图片生成完成','success');

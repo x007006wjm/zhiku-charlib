@@ -211,6 +211,7 @@ function markerPlanFor(text, meta = {}) {
             outfitTags: found.outfitMode === 'fixed' ? tagText(currentOutfitOf(found)?.tags) : '',
             nl: String(found.nl || '').trim(),
             uc: String(found.negative || '').trim(),
+            nsfwBody: String(found.nsfwBody || '').trim(),
             charRef: String(found.charRef || ''),
         };
     };
@@ -308,7 +309,7 @@ export function applyCharLibrary(source) {
 
     // ② 角色的 aliases 字段：新建的角色带上空数组，旧数据没有也照常工作
     patch("const blank = src => ({\n    key: src.key, kind: src.kind, name: src.name, avatar: src.avatar || '', card: src.card || '',\n    appearance: [], outfitMode: 'story', outfits: [], outfitId: '', negative: '', charRef: '',\n});",
-        "const blank = src => ({\n    key: src.key, kind: src.kind, name: src.name, avatar: src.avatar || '', card: src.card || '',\n    appearance: [], aliases: [], nl: '', outfitMode: 'story', outfits: [], outfitId: '', negative: '', charRef: '',\n});",
+        "const blank = src => ({\n    key: src.key, kind: src.kind, name: src.name, avatar: src.avatar || '', card: src.card || '',\n    appearance: [], aliases: [], nl: '', nsfwBody: '', outfitMode: 'story', outfits: [], outfitId: '', negative: '', charRef: '',\n});",
         'blank aliases');
 
     // 读角色时把 aliases 归一化（字符串/数组/旧数据都认）
@@ -338,7 +339,7 @@ export function applyCharLibrary(source) {
 
     // 「把一个角色的外貌套到另一个角色上」也带上描述 nl
     patch('    b.negative = a.negative;\n',
-        '    b.negative = a.negative;\n    b.nl = String(a.nl || \'\');\n',
+        '    b.negative = a.negative;\n    b.nl = String(a.nl || \'\');\n    b.nsfwBody = String(a.nsfwBody || \'\');\n',
         'copyLook nl');
 
     // ⑤ 分享/导入时带上别名与描述 nl
@@ -433,12 +434,15 @@ export function applyCharLibrary(source) {
         + '      <div class="pc-hint">生图标记里写 $名字$ 或别名，会展开成上面「固定外貌」那一串。</div>\n'
         + '      <label class="pc-field"><span>描述 nl（英文自然语言，可空）</span><textarea class="pc-textarea small" data-charnl rows="2" placeholder="a girl with long black hair and blue eyes">${esc(c.nl || \'\')}</textarea></label>\n'
         + '      <div class="pc-hint">只用于 JSON 标记：接在该角色 caption 的 tag 之后、AI 写的 nl 之前；纯文本 $名字$ 只展开 tag，不带描述。</div>\n'
+        + '      <label class="pc-field pc-mt-s"><span>NSFW 身体（仅 NSFW 图发送，可空）</span><textarea class="pc-textarea small mono" data-charnsfwbody rows="2" placeholder="medium breasts, pink nipples, shaved pussy">${esc(c.nsfwBody || \'\')}</textarea></label>\n'
+        + '      <div class="pc-hint">只在 NSFW / explicit / nude 等画面里自动并入该角色；SFW 画面不会发送。画面含 nude/naked/topless 时也会自动跳过「固定穿一套」的衣服。</div>\n'
         + '    </section>\n'
         + '    <details class="pc-fold"><summary><b>不想出现的</b>',
         'aliases input');
     patch('if (el.dataset.charneg !== undefined)',
         'if (el.dataset.charaliases !== undefined) { const c = C.getChar(ui.charKey); if (c) { c.aliases = splitAliases(el.value); C.saveChar(c); } return; }\n'
         + '    if (el.dataset.charnl !== undefined) { const c = C.getChar(ui.charKey); if (c) { c.nl = el.value.trim(); C.saveChar(c); } return; }\n'
+        + '    if (el.dataset.charnsfwbody !== undefined) { const c = C.getChar(ui.charKey); if (c) { c.nsfwBody = el.value.trim(); C.saveChar(c); } return; }\n'
         + '    if (el.dataset.charneg !== undefined)',
         'aliases input handler');
     patch('聊天生图时，再加上 AI 写的动作表情',

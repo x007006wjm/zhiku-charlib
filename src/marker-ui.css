@@ -46,3 +46,39 @@
 .pc-lb-btn:hover{background:rgba(255,255,255,.2)}
 .pc-lb-danger{border-color:rgba(240,90,90,.45);color:#ffb3b3}
 .pc-lb-close{background:rgba(74,144,217,.35);border-color:rgba(74,144,217,.65)}
+
+/* v1.0.1 极简图片卡片（方案 C：角标 ··· + 底部多版本小点 + 居中显示） */
+.mes_text .pc-marker-slot.pc-slot-c{display:block;width:auto;max-width:100%;margin:10px 0;padding:0;border:0;background:transparent;font-size:13px;line-height:1.5}
+.pc-slot-c .pc-c-hidden,.pc-slot-c [hidden]{display:none!important}
+.pc-slot-c>.pc-result-collapse{margin:0;padding:0;border:0;background:transparent}
+.pc-slot-c>.pc-result-collapse>summary{display:none!important}
+.pc-slot-c .pc-c-frame{position:relative;width:fit-content;max-width:100%;margin:0 auto;border-radius:10px;overflow:hidden;line-height:0}
+.pc-slot-c .pc-c-frame .pc-result-image{display:block;margin:0;max-width:100%;max-height:520px;object-fit:contain;cursor:zoom-in}
+.pc-slot-c button.pc-c-more{position:absolute;top:8px;right:8px;width:auto;height:auto;min-height:0;margin:0;padding:0 10px 4px;border:0;border-radius:7px;background:rgba(0,0,0,.48);color:#fff;font:15px/1.4 sans-serif;letter-spacing:.12em;cursor:pointer;box-shadow:none;opacity:.92}
+.pc-slot-c button.pc-c-more.on{background:rgba(0,0,0,.74);opacity:1}
+.pc-slot-c .pc-c-dots{position:absolute;left:0;right:0;bottom:8px;display:flex;justify-content:center;gap:6px;line-height:0}
+.pc-slot-c button.pc-c-dot{width:7px;height:7px;min-height:0;margin:0;padding:0;border:0;border-radius:4px;background:rgba(255,255,255,.5);cursor:pointer;box-shadow:none;transition:width .15s ease}
+.pc-slot-c button.pc-c-dot.on{width:18px;background:#fff}
+.pc-slot-c .pc-c-status{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);padding:4px 14px;border-radius:7px;background:rgba(0,0,0,.64);color:#fff;font:13px/1.6 sans-serif;white-space:nowrap}
+.pc-slot-c .pc-c-row{display:flex;align-items:center;justify-content:center;gap:8px;flex-wrap:wrap}
+.pc-slot-c .pc-c-title{opacity:.72}
+.mes_text .pc-marker-slot.pc-slot-c .pc-c-row .pc-marker-generate{width:auto;min-height:0;margin:0;padding:5px 14px;border:0;border-radius:8px;background:var(--SmartThemeBlurTintColor,rgba(128,128,128,.16));color:inherit;font:inherit;font-size:13px;line-height:1.5;box-shadow:none}
+.mes_text .pc-marker-slot.pc-slot-c .pc-c-row .pc-marker-generate:hover{background:rgba(128,128,128,.24)}
+.pc-slot-c .pc-c-row button.pc-c-more{position:static;background:rgba(128,128,128,.18);color:inherit}
+.pc-slot-c button.pc-c-folded{display:block;width:auto;min-height:0;margin:0 auto;padding:6px 14px;border:0;border-radius:8px;background:rgba(128,128,128,.13);color:inherit;font:inherit;font-size:13px;cursor:pointer;box-shadow:none}
+.pc-slot-c .pc-c-menu{max-width:min(100%,420px);margin:8px auto 0;padding:4px 0;border-radius:10px;background:var(--SmartThemeBlurTintColor,rgba(128,128,128,.12));overflow:hidden}
+.pc-slot-c button.pc-c-item{display:flex;justify-content:space-between;align-items:baseline;gap:12px;width:100%;min-height:0;margin:0;padding:9px 14px;border:0;border-radius:0;background:transparent;color:inherit;font:inherit;font-size:13.5px;text-align:left;cursor:pointer;box-shadow:none}
+.pc-slot-c button.pc-c-item:hover{background:rgba(128,128,128,.13)}
+.pc-slot-c button.pc-c-item:disabled{opacity:.45;cursor:default}
+.pc-slot-c button.pc-c-item small{font-size:12px;opacity:.6;text-align:right}
+.pc-slot-c button.pc-c-item.pc-c-del{color:#d9897e}
+/* 纸页风格修改提示词面板 */
+.pc-image-preview .pc-image-dialog.pc-c-panel{display:flex;flex-direction:column;align-items:stretch;justify-content:flex-start;gap:0;position:relative;width:min(94vw,520px);max-height:calc(100dvh - 32px);padding:20px 20px 18px;border-radius:16px;background:var(--pc-paper,#f4efe4);color:var(--pc-ink,#3a2a22);font-family:var(--pc-font,serif);box-shadow:0 18px 50px rgba(0,0,0,.35);box-sizing:border-box}
+.pc-c-panel .pc-c-head{font-family:var(--pc-font-name,var(--pc-font,serif));font-size:19px;font-weight:600;letter-spacing:.04em;line-height:1.3;padding-right:56px}
+.pc-c-panel .pc-c-label{margin-top:14px;font-family:var(--pc-font-label,monospace);font-size:11px;letter-spacing:.2em;color:var(--pc-ink-soft,#6e5a4d)}
+.pc-image-dialog.pc-c-panel textarea{flex:none;width:100%;box-sizing:border-box;margin-top:8px;padding:10px 12px!important;border:0!important;border-radius:10px!important;outline:none!important;background:var(--pc-paper-2,#ebe4d2)!important;color:var(--pc-ink,#3a2a22)!important;box-shadow:none!important;min-height:140px;max-height:42vh;resize:vertical;font:12.5px/1.6 var(--pc-font-label,monospace)}
+.pc-c-panel .pc-c-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:12px}
+.pc-image-dialog.pc-c-panel button.pc-c-btn{width:auto;min-height:0;margin:0;padding:7px 18px;border-radius:999px;border:1px solid var(--pc-ink,#3a2a22);background:var(--pc-ink,#3a2a22);color:var(--pc-paper,#f4efe4);font:500 14px/1.4 var(--pc-font,serif);letter-spacing:.04em;cursor:pointer;box-shadow:none}
+.pc-image-dialog.pc-c-panel button.pc-c-btn.soft{background:transparent;color:var(--pc-ink,#3a2a22);border-color:var(--pc-dash,rgba(58,42,34,.45))}
+.pc-image-dialog.pc-c-panel button.pc-c-btn.danger{background:transparent;color:#b8453a;border-color:rgba(184,69,58,.45)}
+.pc-image-dialog.pc-c-panel button.pc-c-close{position:absolute;top:16px;right:16px;width:auto;min-height:0;margin:0;padding:3px 10px;border:0;border-radius:999px;background:var(--pc-paper-2,#ebe4d2);color:var(--pc-ink-soft,#6e5a4d);font:13px/1.5 var(--pc-font,serif);cursor:pointer;box-shadow:none}

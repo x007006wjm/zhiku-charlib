@@ -8,6 +8,217 @@ function setTimeout(fn, delay, ...args) {
     timers.add(id); return id;
 }
 function clearTimeout(id) { window.clearTimeout(id); timers.delete(id); }
+// 独立 IndexedDB 历史生图记录（默认最多 2000 条，完全不占画师库主存档）
+
+function createHistoryStore({ idb = globalThis.indexedDB, maxItems = 2000 } = {}) {
+    const DB_NAME = 'zhiku_history';
+    const STORE = 'entries';
+    let dbp = null;
+    let list = [];
+    let loaded = false;
+    let loading = null;
+    let idbOk = !!idb;
+    let queue = Promise.resolve();
+
+    const open = () => (dbp ||= new Promise((resolve, reject) => {
+        if (!idb) { reject(new Error('IndexedDB unavailable')); return; }
+        const req = idb.open(DB_NAME, 1);
+        req.onupgradeneeded = () => {
+            if (!req.result.objectStoreNames.contains(STORE)) {
+                req.result.createObjectStore(STORE, { keyPath: 'id' });
+            }
+        };
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+    }).catch(e => { dbp = null; throw e; }));
+
+    const tx = async (mode, fn) => {
+        const db = await open();
+        return new Promise((resolve, reject) => {
+            const t = db.transaction(STORE, mode);
+            let req;
+            t.oncomplete = () => resolve(req?.result);
+            t.onerror = t.onabort = () => reject(t.error || new Error('History tx aborted'));
+            try { req = fn(t.objectStore(STORE)); } catch (e) { t.abort(); reject(e); }
+        });
+    };
+
+    const serial = fn => {
+        const next = queue.then(fn);
+        queue = next.catch(() => {});
+        return next;
+    };
+
+    const dedupeSort = rows => {
+        const seen = new Set();
+        return rows
+            .filter(x => x && x.id && x.image)
+            .sort((a, b) => (b.at || 0) - (a.at || 0))
+            .filter(x => { if (seen.has(x.id)) return false; seen.add(x.id); return true; });
+    };
+
+    function load() {
+        return (loading ||= (async () => {
+            if (!idbOk) { loaded = true; return list; }
+            try {
+                const stored = (await tx('readonly', st => st.getAll())) || [];
+                list = dedupeSort(stored);
+            } catch (e) {
+                idbOk = false;
+                console.warn('[智库] 历史生图 IndexedDB 打开失败，退回内存记录', e);
+            }
+            loaded = true;
+            return list;
+        })());
+    }
+
+    function add(entry) {
+        return serial(async () => {
+            await load();
+            if (!entry || !entry.image) return;
+            const item = {
+                id: entry.id || ('h_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 7)),
+                at: Number(entry.at) || Date.now(),
+                image: String(entry.image),
+                prompt: String(entry.prompt || ''),
+                negative: String(entry.negative || ''),
+                size: String(entry.size || ''),
+                seed: entry.seed ?? '',
+                source: String(entry.source || 'studio'),
+            };
+            const merged = dedupeSort([item, ...list]);
+            const kept = merged.slice(0, maxItems);
+            const dropped = merged.slice(maxItems).map(x => x.id);
+            if (idbOk) {
+                try {
+                    await tx('readwrite', st => {
+                        st.put(item);
+                        for (const id of dropped) st.delete(id);
+                    });
+                } catch (e) {
+                    idbOk = false;
+                    console.warn('[智库] 历史生图写入失败', e);
+                }
+            }
+            list = kept;
+        });
+    }
+
+    function remove(id) {
+        return serial(async () => {
+            await load();
+            list = list.filter(x => x.id !== id);
+            if (idbOk) {
+                try { await tx('readwrite', st => st.delete(id)); } catch {}
+            }
+        });
+    }
+
+    function clear() {
+        return serial(async () => {
+            await load();
+            list = [];
+            if (idbOk) {
+                try { await tx('readwrite', st => st.clear()); } catch {}
+            }
+        });
+    }
+
+    return {
+        load,
+        loaded: () => loaded,
+        all: () => list,
+        count: () => list.length,
+        add,
+        remove,
+        clear,
+    };
+}
+
+// 画师库多端合并与墓碑/复活时间管理（防删过又加回来的死循环）
+
+const LIBRARY_MAPS = [
+    'artists', 'groups', 'collections', 'characters', 'outfits',
+    'vibeGroups', 'charRefGroups', 'blacklist', 'bindings', 'chatCast',
+];
+
+function recordLibraryDeletes(data, before, now = Date.now()) {
+    if (!data || typeof data !== 'object') return;
+    data.options ||= {};
+    const ts = Number(data.options.savedAt) || now;
+    const deleted = (data.options.libraryDeleted ||= {});
+    const revived = (data.options.libraryRevived ||= {});
+    for (const key of LIBRARY_MAPS) {
+        const cur = data[key] || {};
+        const prev = before?.[key] || {};
+        for (const id of Object.keys(prev)) {
+            if (!Object.hasOwn(cur, id)) {
+                (deleted[key] ||= {})[id] = ts;
+            }
+        }
+        for (const id of Object.keys(cur)) {
+            if (deleted[key]?.[id]) {
+                delete deleted[key][id];
+                (revived[key] ||= {})[id] = ts;
+            }
+        }
+    }
+}
+
+function mergeLibraryAdditions(data, other) {
+    if (!data || !other || typeof other !== 'object') return 0;
+    data.options ||= {};
+    const deleted = (data.options.libraryDeleted ||= {});
+    const revived = (data.options.libraryRevived ||= {});
+    let added = 0;
+
+    for (const key of LIBRARY_MAPS) {
+        const target = (data[key] ||= {});
+        const revMap = (revived[key] ||= {});
+        const delMap = (deleted[key] ||= {});
+
+        // 1) 合并两边复活时间（取较大值）
+        for (const [id, at] of Object.entries(other.options?.libraryRevived?.[key] || {})) {
+            const t = Number(at);
+            if (Number.isFinite(t) && t > 0) revMap[id] = Math.max(Number(revMap[id]) || 0, t);
+        }
+        // 2) 合并两边删除墓碑（取较大值），但若复活时间 >= 删除时间则墓碑作废
+        for (const [id, at] of Object.entries(other.options?.libraryDeleted?.[key] || {})) {
+            const t = Number(at);
+            if (Number.isFinite(t) && t > 0) delMap[id] = Math.max(Number(delMap[id]) || 0, t);
+        }
+        for (const id of Object.keys(delMap)) {
+            if ((Number(revMap[id]) || 0) >= (Number(delMap[id]) || 0)) {
+                delete delMap[id];
+            }
+        }
+        // 3) 清理有效墓碑对应条目
+        for (const id of Object.keys(delMap)) {
+            delete target[id];
+        }
+        // 4) 合入对方新增且未被有效墓碑删除的条目
+        for (const [id, item] of Object.entries(other[key] || {})) {
+            if (['__proto__', 'prototype', 'constructor'].includes(id)) continue;
+            if (delMap[id] || Object.hasOwn(target, id)) continue;
+            target[id] = structuredClone(item);
+            added++;
+        }
+    }
+
+    // 合入的新画师组不能引用已被显式删除的画师
+    for (const group of Object.values(data.groups || {})) {
+        if (Array.isArray(group.members)) {
+            group.members = group.members.filter(m => data.artists[m.artistId]);
+        }
+    }
+    return added;
+}
+
+function libraryEntryCount(d) {
+    if (!d || typeof d !== 'object') return 0;
+    return LIBRARY_MAPS.reduce((sum, k) => sum + Object.keys(d[k] || {}).length, 0);
+}
+
 // 画师串 / 单个画师独立出图参数（模型、采样器、噪声计划、步数、CFG、Rescale）
 // 空项沿用全局设置；用这串出图时临时套用，不改全局设置。
 
@@ -389,7 +600,7 @@ function deleteUcpPreset(presets, id) {
     return normalizeUcpPresets(presets).filter(p => p.id !== target);
 }
 
-// 智库 · 原生扩展版 v1.0.0（二改自从前佬的智绘姬）
+// 智库 · 原生扩展版 v1.0.1（二改自从前佬的智绘姬）
 // 不需要智绘姬，填 NovelAI key 就能用。
 // NovelAI 请求格式参考了智绘姬（作者：从前跟你一样，https://github.com/damoshen123/st-chatu8，AFPL v9）。
 const P = (() => { try { if (window.parent && window.parent !== window && window.parent.document) return window.parent; } catch (e) { /* 跨域 */ } return window; })();
@@ -407,7 +618,7 @@ const __shim = {
     get extension_settings() { return __ctx().extensionSettings; },
 };
 
-globalThis.__PC_VERSION = '1.0.0';
+globalThis.__PC_VERSION = '1.0.1';
 
 // ───── model.js ─────
 const __mod_model = (() => {
@@ -951,33 +1162,150 @@ function utf8ToBase64(str) {
     return btoa(bin);
 }
 
-async function loadData() {
+const IDB_BACKUP_DB = 'zhiku_library_backup';
+const IDB_BACKUP_STORE = 'kv';
+const IDB_BACKUP_KEY = 'piaoce_data';
+const MAX_INLINE_BACKUP_BYTES = 1500000;
+let lastSavedSnapshot = null;
+const storageDiag = { activeSource: 'none', fileOk: false, idbOk: false, extOk: false, lsOk: false, bytes: 0, times: {} };
+
+function idbOpenBackup() {
+    const idb = P.indexedDB || globalThis.indexedDB;
+    if (!idb) return Promise.reject(new Error('IndexedDB unavailable'));
+    return new Promise((resolve, reject) => {
+        const req = idb.open(IDB_BACKUP_DB, 1);
+        req.onupgradeneeded = () => { if (!req.result.objectStoreNames.contains(IDB_BACKUP_STORE)) req.result.createObjectStore(IDB_BACKUP_STORE); };
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+    });
+}
+async function idbReadBackup() {
     try {
-        const res = await fetch(`/user/files/${DATA_FILE}?t=${Date.now()}`, { cache: 'no-store' });
-        if (res.status === 404) {
-            const backup = localStorage.getItem(LOCAL_BACKUP);
-            data = normalizeData(backup ? JSON.parse(backup) : null);
-            loadedFromServer = true;
-        } else if (res.ok) {
-            data = normalizeData(await res.json());
-            loadedFromServer = true;
-        } else {
-            throw new Error(`HTTP ${res.status}`);
-        }
+        const db = await idbOpenBackup();
+        const val = await new Promise((resolve, reject) => {
+            const t = db.transaction(IDB_BACKUP_STORE, 'readonly');
+            const req = t.objectStore(IDB_BACKUP_STORE).get(IDB_BACKUP_KEY);
+            req.onsuccess = () => resolve(req.result || null);
+            req.onerror = () => reject(req.error);
+        });
+        storageDiag.idbOk = true;
+        return typeof val === 'string' ? JSON.parse(val) : (val && typeof val === 'object' ? val : null);
+    } catch {
+        storageDiag.idbOk = false;
+        return null;
+    }
+}
+async function idbWriteBackup(json) {
+    try {
+        const db = await idbOpenBackup();
+        await new Promise((resolve, reject) => {
+            const t = db.transaction(IDB_BACKUP_STORE, 'readwrite');
+            t.objectStore(IDB_BACKUP_STORE).put(json, IDB_BACKUP_KEY);
+            t.oncomplete = () => resolve();
+            t.onerror = t.onabort = () => reject(t.error);
+        });
+        storageDiag.idbOk = true;
+    } catch {
+        storageDiag.idbOk = false;
+    }
+}
+function readExtBackup() {
+    try {
+        const raw = P.SillyTavern?.getContext?.()?.extensionSettings?.zhiku_lib_backup;
+        storageDiag.extOk = true;
+        return typeof raw === 'string' ? JSON.parse(raw) : (raw && typeof raw === 'object' ? raw : null);
+    } catch { return null; }
+}
+function writeExtBackup(json) {
+    try {
+        if (json.length > MAX_INLINE_BACKUP_BYTES) return;
+        const c = P.SillyTavern?.getContext?.();
+        if (!c?.extensionSettings) return;
+        c.extensionSettings.zhiku_lib_backup = json;
+        c.saveSettingsDebounced?.();
+        storageDiag.extOk = true;
+    } catch {}
+}
+function readLsBackup() {
+    try {
+        const raw = localStorage.getItem(LOCAL_BACKUP);
+        storageDiag.lsOk = true;
+        return raw ? JSON.parse(raw) : null;
+    } catch { return null; }
+}
+async function readServerFile() {
+    const res = await fetch(`/user/files/${DATA_FILE}?t=${Date.now()}`, { cache: 'no-store' });
+    if (res.status === 404) return { ok: true, missing: true, data: null };
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return { ok: true, missing: false, data: normalizeData(await res.json()) };
+}
+
+async function loadData() {
+    let server = null, serverOk = false;
+    try {
+        const r = await readServerFile();
+        serverOk = r.ok;
+        server = r.data;
     } catch (e) {
-        console.warn('[票册] 从酒馆读取数据失败，先用本地备份', e);
-        const backup = localStorage.getItem(LOCAL_BACKUP);
-        data = normalizeData(backup ? JSON.parse(backup) : null);
-        loadedFromServer = false;
-        toastr.warning('票册数据没能从酒馆读到，这次的改动先存在浏览器里。', '画师票册');
+        console.warn('[票册] 从酒馆读取数据失败，尝试使用本地多份备份', e);
+    }
+    const idbRaw = await idbReadBackup();
+    const extRaw = readExtBackup();
+    const lsRaw = readLsBackup();
+    const cands = [
+        ['file', server],
+        ['idb', idbRaw ? normalizeData(idbRaw) : null],
+        ['ext', extRaw ? normalizeData(extRaw) : null],
+        ['ls', lsRaw ? normalizeData(lsRaw) : null],
+    ].filter(([, d]) => d);
+    storageDiag.fileOk = serverOk;
+    storageDiag.times = Object.fromEntries(cands.map(([k, d]) => [k, Number(d.options?.savedAt) || 0]));
+    cands.sort((a, b) => ((Number(b[1].options?.savedAt) || 0) - (Number(a[1].options?.savedAt) || 0)) || (libraryEntryCount(b[1]) - libraryEntryCount(a[1])));
+    const best = cands[0] || null;
+    data = best ? best[1] : normalizeData(null);
+    storageDiag.activeSource = best ? best[0] : 'empty';
+    // 合并其他来源的新增条目，防多端覆盖
+    for (const [k, other] of cands.slice(1)) {
+        try { mergeLibraryAdditions(data, other); } catch {}
+    }
+    if (server && best?.[0] !== 'file') {
+        try { mergeLibraryAdditions(data, server); } catch {}
+    }
+    loadedFromServer = serverOk;
+    lastSavedSnapshot = structuredClone(data);
+    storageDiag.bytes = JSON.stringify(data).length;
+    if (!serverOk && best) {
+        toastr.warning('画师库数据文件暂时没读到，已从本地备份恢复；连上酒馆后会自动同步回去。', '智库');
+    } else if (serverOk && best && best[0] !== 'file') {
+        // 本地备份比服务器文件新：马上补写回服务器
+        commit({ immediate: true, silent: true });
     }
     emit();
     return data;
 }
 
 async function writeNow() {
-    const json = JSON.stringify(data);
-    try { localStorage.setItem(LOCAL_BACKUP, json); } catch { /* 太大就算了 */ }
+    data.options ||= {};
+    data.options.savedAt = Date.now();
+    if (lastSavedSnapshot) recordLibraryDeletes(data, lastSavedSnapshot, data.options.savedAt);
+    let target = data;
+    if (loadedFromServer) {
+        try {
+            const remote = await readServerFile();
+            if (remote.data) {
+                const merged = mergeLibraryAdditions(data, remote.data);
+                if (merged > 0) emit();
+            }
+        } catch { /* 读取远端失败不阻断本次保存 */ }
+    }
+    const json = JSON.stringify(target);
+    storageDiag.bytes = json.length;
+    await idbWriteBackup(json);
+    writeExtBackup(json);
+    if (json.length <= MAX_INLINE_BACKUP_BYTES) {
+        try { localStorage.setItem(LOCAL_BACKUP, json); storageDiag.lsOk = true; } catch { storageDiag.lsOk = false; }
+    }
+    lastSavedSnapshot = structuredClone(target);
     if (!loadedFromServer) return; // 没读到服务器的数据时不覆盖，免得把服务器上的旧数据清掉
     const res = await fetch('/api/files/upload', {
         method: 'POST',
@@ -985,6 +1313,23 @@ async function writeNow() {
         body: JSON.stringify({ name: DATA_FILE, data: utf8ToBase64(json) }),
     });
     if (!res.ok) throw new Error(`保存失败 HTTP ${res.status}`);
+    storageDiag.fileOk = true;
+    storageDiag.times.file = data.options.savedAt;
+}
+
+function diagnoseStorage() {
+    const fmt = t => t ? new Date(t).toLocaleString() : '无';
+    const kb = Math.round((storageDiag.bytes || 0) / 1024);
+    const names = { file: '酒馆数据文件', idb: '浏览器 IndexedDB', ext: '酒馆扩展设置', ls: '浏览器 localStorage', empty: '全新空白' };
+    return [
+        `当前使用：${names[storageDiag.activeSource] || storageDiag.activeSource}`,
+        `存档大小：约 ${kb} KB（画师 ${Object.keys(data.artists || {}).length} · 画师组 ${Object.keys(data.groups || {}).length} · 角色 ${Object.keys(data.characters || {}).length}）`,
+        `1. 酒馆文件（user/files/${DATA_FILE}）：${storageDiag.fileOk ? '可读写' : '不可用'} · ${fmt(storageDiag.times.file)}`,
+        `2. 浏览器 IndexedDB：${storageDiag.idbOk ? '正常' : '不可用'} · ${fmt(storageDiag.times.idb)}`,
+        `3. 酒馆扩展设置备份：${storageDiag.extOk ? '正常' : '未启用/超大跳过'} · ${fmt(storageDiag.times.ext)}`,
+        `4. 浏览器 localStorage：${storageDiag.lsOk ? '正常' : '未启用/超大跳过'} · ${fmt(storageDiag.times.ls)}`,
+        storageDiag.fileOk ? '结论：四重备份正常，数据安全。' : '结论：酒馆数据文件当前读不到，改动暂存在浏览器备份中。',
+    ].join('\n');
 }
 
 /** 改完数据调用：立刻通知界面，稍后写到服务器 */
@@ -1072,7 +1417,7 @@ async function shrinkDataUrl(dataUrl, maxSide = 1024, quality = 0.88) {
     return c.toDataURL('image/jpeg', quality);
 }
 
-return { getData, onChange, loadData, commit, replaceData, uploadImage, deleteImageFile, imgUrl, fileToDataUrl, urlToDataUrl, shrinkDataUrl, flush: () => saveTimer !== null ? commit({ immediate: true, silent: true }) : saving };
+return { getData, onChange, loadData, commit, replaceData, uploadImage, deleteImageFile, imgUrl, fileToDataUrl, urlToDataUrl, shrinkDataUrl, diagnoseStorage, flush: () => saveTimer !== null ? commit({ immediate: true, silent: true }) : saving };
 })();
 
 // ───── lobby.js ─────
@@ -2740,6 +3085,18 @@ function buildMarkerBase(payload) {
 const CLOSE_FRAMING_RE = /^(?:close-up|upper body|portrait|face)$/i;
 const WIDE_FRAMING_RE = /^(?:full body|wide shot|medium shot|cowboy shot|lower body)$/i;
 const LOWER_OUTFIT_RE = /\b(?:shoes?|boots?|sneakers?|sandals?|heels?|high heels?|loafers?|slippers?|barefoot|footwear|socks?|knee highs?|thighhighs?|stockings?|pantyhose|tights|leggings|garter(?: straps?)?|skirts?|miniskirts?|pants|jeans|shorts|trousers|panties|underwear|anklets?|legwear)\b/i;
+const NSFW_PROMPT_RE = /(?:^|[\s,;|(])(?:nsfw|explicit|r18|r-18|rating:explicit|nude|completely nude|naked|topless|bottomless|nipples|pussy|penis|uncensored|sex|vaginal|anal|fellatio|paizuri|cum|creampie|pubic hair|areolae|genitals)(?=$|[\s,;|)])/i;
+const NUDE_PROMPT_RE = /(?:^|[\s,;|(])(?:nude|completely nude|naked|topless|bottomless|no clothes|undressed|unclothed)(?=$|[\s,;|)])/i;
+
+/** 判断提示词或描述是否属于 NSFW 画面（独立词匹配，不误伤 sfw）。 */
+function isNsfwPrompt(text) {
+    return NSFW_PROMPT_RE.test(String(text ?? ''));
+}
+
+/** 判断提示词或描述是否要求裸体 / 无衣（用于跳过角色库固定衣服）。 */
+function isNudePrompt(text) {
+    return NUDE_PROMPT_RE.test(String(text ?? ''));
+}
 
 /** 景别是否为特写 / 半身（不含全身/中景/远景）：用于过滤框外下半身/鞋袜固定服装。 */
 function isCloseFraming(baseTag) {
@@ -2781,17 +3138,25 @@ function buildMarkerPlan(payload, { lookup = () => null, expand = value => value
     const baseTag = textOf(payload?.tag);
     const characters = [];
     const charRefs = [];
+    const baseIsNsfw = isNsfwPrompt(base);
+    const baseIsNude = isNudePrompt(base);
     for (const entry of payload?.characters || []) {
         const info = lookup(entry.name);
         let tag = expand(entry.tag || '');
+        const charContext = [tag, expand(entry.nl || '')].filter(Boolean).join(', ');
+        const charIsNsfw = baseIsNsfw || isNsfwPrompt(charContext);
+        const charIsNude = baseIsNude || isNudePrompt(charContext);
         let libraryTags = '';
         if (info) {
+            const nsfwBody = charIsNsfw && info.nsfwBody ? expand(info.nsfwBody) : '';
             if (info.appearanceTags !== undefined || info.outfitTags !== undefined) {
                 const app = info.appearanceTags ? expand(info.appearanceTags) : '';
-                const outfit = info.outfitTags ? filterOutfitForFraming(expand(info.outfitTags), baseTag) : '';
-                libraryTags = [app, outfit].filter(Boolean).join(', ');
+                const outfit = !charIsNude && info.outfitTags ? filterOutfitForFraming(expand(info.outfitTags), baseTag) : '';
+                libraryTags = [app, nsfwBody, outfit].filter(Boolean).join(', ');
             } else if (info.tags) {
-                libraryTags = expand(info.tags);
+                libraryTags = [expand(info.tags), nsfwBody].filter(Boolean).join(', ');
+            } else if (nsfwBody) {
+                libraryTags = nsfwBody;
             }
         }
         if (libraryTags) tag = injectLibraryTags(tag, libraryTags);
@@ -3258,6 +3623,7 @@ function normalizeChatEntry(raw) {
         outfits,
         outfitId,
         negative: typeof raw.negative === 'string' ? raw.negative.trim() : '',
+        nsfwBody: typeof raw.nsfwBody === 'string' ? raw.nsfwBody.trim() : '',
         source: raw.source === 'ai' ? 'ai' : 'manual',
         history: normalizeHistory(raw.history),
     };
@@ -3288,6 +3654,7 @@ function entryFromGlobal(character) {
         outfits: character?.outfits,
         outfitId: character?.outfitId,
         negative: character?.negative,
+        nsfwBody: character?.nsfwBody,
         source: 'manual',
         history: [],
     });
@@ -3306,6 +3673,7 @@ function globalFromChatEntry(entry) {
         outfits: normalized.outfits,
         outfitId: normalized.outfitId,
         negative: normalized.negative || '',
+        nsfwBody: normalized.nsfwBody || '',
         charRef: '',
     };
 }
@@ -3330,6 +3698,7 @@ function mergeCharacterLayers(chatEntry, globalChar) {
         outfits: normalizeOutfits(globalChar.outfits),
         outfitId: String(globalChar.outfitId ?? ''),
         negative: typeof globalChar.negative === 'string' ? globalChar.negative.trim() : '',
+        nsfwBody: typeof globalChar.nsfwBody === 'string' ? globalChar.nsfwBody.trim() : '',
         charRef: String(globalChar.charRef ?? ''),
     };
     const useChatAppearance = chat.appearance.length > 0;
@@ -3346,6 +3715,7 @@ function mergeCharacterLayers(chatEntry, globalChar) {
         outfits: useChatOutfit ? chat.outfits : global.outfits,
         outfitId: useChatOutfit ? chat.outfitId : (global.outfitId || global.outfits[0]?.id || ''),
         negative: chat.negative || global.negative,
+        nsfwBody: chat.nsfwBody || global.nsfwBody,
         charRef: chat.charRef || global.charRef,
     };
     return {
@@ -3560,7 +3930,7 @@ function currentPersonaKey() {
 
 const blank = src => ({
     key: src.key, kind: src.kind, name: src.name, avatar: src.avatar || '', card: src.card || '',
-    appearance: [], aliases: [], nl: '', outfitMode: 'story', outfits: [], outfitId: '', negative: '', charRef: '',
+    appearance: [], aliases: [], nl: '', nsfwBody: '', outfitMode: 'story', outfits: [], outfitId: '', negative: '', charRef: '',
 });
 
 /** 取一个角色（还没写过外貌的也给一份空的，存档时才写进数据） */
@@ -3844,6 +4214,7 @@ function copyLook(fromKey, toKey) {
     b.outfitId = b.outfits[0]?.id || '';
     b.negative = a.negative;
     b.nl = String(a.nl || '');
+    b.nsfwBody = String(a.nsfwBody || '');
     saveChar(b);
 }
 
@@ -4091,6 +4462,7 @@ function markerPlanFor(text, meta = {}) {
             outfitTags: found.outfitMode === 'fixed' ? tagText(currentOutfitOf(found)?.tags) : '',
             nl: String(found.nl || '').trim(),
             uc: String(found.negative || '').trim(),
+            nsfwBody: String(found.nsfwBody || '').trim(),
             charRef: String(found.charRef || ''),
         };
     };
@@ -4299,38 +4671,90 @@ function createMarkerController({context,getData,generate,upload,notify,expandPr
             const token=tokens[index];if(!token)return;
             const key=recordKey(msg,token);
             const record=msg.extra?.zhikuImages?.[key];
-            const ready=token.raw+'|'+(record?.url||'');
+            const vsCount=Array.isArray(record?.versions)?record.versions.length:0;
+            const ready=token.raw+'|'+(record?.url||'')+'|'+vsCount;
             if(slot.dataset.pcReady===ready) {
                 const b=slot.querySelector('button');if(b){b.disabled=!!state(msg,token);b.textContent=label(msg,token,record);}
                 if(record?.url&&cfg.expand&&freshResults.delete(key)){
                     const w=slot.querySelector('.pc-result-collapse');
                     if(w){w.open=true;const h=w.querySelector('summary');if(h)h.textContent='图片 · 点击收起';}
                 }
+                slot._pcSync?.();
                 return;
             }
             slot.dataset.pcReady=ready;
             slot.replaceChildren();
-            const details=doc.createElement('details'),summary=doc.createElement('summary'),pre=doc.createElement('pre'),button=doc.createElement('button');
-            summary.textContent='图片提示词';pre.textContent=token.prompt;
-            details.append(summary,pre);button.type='button';button.className='pc-marker-generate';button.title='点击生成，长按编辑提示词';
+            const makeEl=(tag,cls,text)=>{const e=doc.createElement(tag);if(cls)e.className=cls;if(text!=null)e.textContent=text;if(tag==='button')e.type='button';return e;};
+            const button=makeEl('button','pc-marker-generate');button.title='点击生成，长按编辑提示词';
             button.disabled=!!state(msg,token);button.textContent=label(msg,token,record);
             button.addEventListener('click',ev=>{ev.preventDefault();ev.stopPropagation();if(button._pcHeld)return;void process(Number(id),{manual:true,tokenIndex:index});});
-            slot.append(details,button);
             const edit=()=>editPrompt(id,msg,token,index);
             bindHold(button,edit);
+            slot.classList.add('pc-slot-c');
+            const menu=makeEl('div','pc-c-menu');menu.hidden=true;
+            const more=makeEl('button','pc-c-more','···');more.title='更多：重画、修改提示词、删掉';
+            more.addEventListener('click',ev=>{ev.preventDefault();ev.stopPropagation();menu.hidden=!menu.hidden;more.classList.toggle('on',!menu.hidden);});
+            const menuItem=(text,hint,fn,cls)=>{const b=makeEl('button','pc-c-item'+(cls?' '+cls:'')),t=makeEl('span','',text),h=makeEl('small','',hint||'');b.append(t,h);b.addEventListener('click',ev=>{ev.preventDefault();ev.stopPropagation();if(!b.disabled)fn(b,t);});return b;};
+            const redo=menuItem(record?.url?'重画':'生成图片',record?.url?'同一段提示词再画一次':'',()=>{menu.hidden=true;more.classList.remove('on');void process(Number(id),{manual:true,tokenIndex:index});});
+            const editBtn=menuItem('修改提示词','查看或编辑提示词后重画',()=>{menu.hidden=true;more.classList.remove('on');edit();});
+            let armed=0;
+            const dropBtn=menuItem('删掉这张','连标记一起删',async(b,t)=>{
+                if(!armed){t.textContent='再点一次删掉';armed=setTimeout(()=>{armed=0;t.textContent='删掉这张';},3000);holds.add(armed);return;}
+                clearTimeout(armed);holds.delete(armed);armed=0;b.disabled=true;t.textContent='删除中…';
+                try{await deleteMarkerAndResult(Number(id),msg,token);}catch(e){notify(e?.message||String(e),'error');b.disabled=false;t.textContent='删掉这张';}
+            },'pc-c-del');
             if(record?.url){
-                const wrapper=doc.createElement('details');wrapper.className='pc-result-collapse';
-                const header=doc.createElement('summary');
-                const img=doc.createElement('img');img.src=record.url;img.className='pc-result-image';img.alt='生成图片';img.loading='lazy';img.decoding='async';
-                wrapper.append(header,img);slot.append(wrapper);
-                // 「生成后自动展开」：只对这次刚生成的那张生效，历史图片仍旧收起
-                const fresh=freshResults.delete(recordKey(msg,token)),autoOpen=cfg.expand&&fresh;
-                const syncHeader=()=>{header.textContent=wrapper.open?'图片 · 点击收起':'图片 · 点击展开';};
+                button.classList.add('pc-c-hidden');
+                const wrapper=makeEl('details','pc-result-collapse');
+                const header=makeEl('summary');
+                const frame=makeEl('div','pc-c-frame');
+                const status=makeEl('div','pc-c-status');status.hidden=true;
+                const img=makeEl('img','pc-result-image');img.src=record.url;img.alt='生成图片';img.loading='lazy';img.decoding='async';
+                frame.append(img,more,status);
+                const vs=Array.isArray(record.versions)?record.versions:[];
+                if(vs.length>1){
+                    const cur=Math.max(0,vs.findIndex(v=>v.url===record.url));
+                    const dots=makeEl('div','pc-c-dots');
+                    vs.forEach((v,vi)=>{
+                        const dot=makeEl('button','pc-c-dot'+(vi===cur?' on':''));
+                        dot.title=`第 ${vi+1}/${vs.length} 版`;
+                        dot.addEventListener('click',ev=>{ev.preventDefault();ev.stopPropagation();if(vi!==cur)void switchVersion(Number(id),msg,token,vi);});
+                        dots.append(dot);
+                    });
+                    frame.append(dots);
+                    let sx=null,sy=0;
+                    img.addEventListener('pointerdown',e=>{sx=e.clientX;sy=e.clientY;});
+                    img.addEventListener('pointerup',e=>{if(sx==null)return;const dx=e.clientX-sx,dy=e.clientY-sy;sx=null;if(Math.abs(dx)>40&&Math.abs(dx)>Math.abs(dy)*1.5){const to=cur+(dx<0?1:-1);if(vs[to]){img._pcHeld=true;setTimeout(()=>{img._pcHeld=false;},400);void switchVersion(Number(id),msg,token,to);}}});
+                }
+                wrapper.append(header,frame);
+                const folded=makeEl('button','pc-c-folded');
+                const foldItem=menuItem('收起图片','',()=>{wrapper.open=!wrapper.open;syncOpen();menu.hidden=true;more.classList.remove('on');});
+                const syncOpen=()=>{
+                    const isOpen=!!wrapper.open;
+                    header.textContent=isOpen?'图片 · 点击收起':'图片 · 点击展开';
+                    folded.hidden=isOpen;
+                    folded.textContent=vs.length>1?`图片已收起（${vs.length} 版） · 点开`:'图片已收起 · 点开';
+                    if(foldItem.firstChild)foldItem.firstChild.textContent=isOpen?'收起图片':'展开图片';
+                    if(!isOpen&&!menu.hidden){menu.hidden=true;more.classList.remove('on');}
+                };
+                folded.addEventListener('click',ev=>{ev.preventDefault();ev.stopPropagation();wrapper.open=true;syncOpen();});
+                const fresh=freshResults.delete(key),autoOpen=cfg.expand&&fresh;
                 if(autoOpen)wrapper.open=true;
-                syncHeader();wrapper.addEventListener('toggle',syncHeader);
+                syncOpen();
+                wrapper.addEventListener('toggle',syncOpen);
                 img.addEventListener('click',ev=>{ev.preventDefault();ev.stopPropagation();if(!img._pcHeld)preview(id,msg,token,index,record);});
                 bindHold(img,edit);
-                button.textContent=label(msg,token,record);
+                menu.append(redo,editBtn,foldItem,dropBtn);
+                slot.append(button,wrapper,folded,menu);
+                slot._pcSync=()=>{const busy=!!button.disabled;status.hidden=!busy;status.textContent=button.textContent;redo.disabled=editBtn.disabled=dropBtn.disabled=busy;syncOpen();};
+                slot._pcSync();
+            }else{
+                const row=makeEl('div','pc-c-row');
+                row.append(makeEl('span','pc-c-title','生图标记'),button,more);
+                menu.append(editBtn,dropBtn);
+                slot.append(row,menu);
+                slot._pcSync=()=>{editBtn.disabled=dropBtn.disabled=!!button.disabled;};
+                slot._pcSync();
             }
 
         });
@@ -4444,6 +4868,42 @@ function createMarkerController({context,getData,generate,upload,notify,expandPr
         try{await context().saveChat();}catch(e){records[key]=old;throw e;}
         decorate(id);
     }
+    async function switchVersion(id,msg,token,verIdx){
+        if(pending.has(msg))return;
+        if(context().chat?.[id]!==msg)return;
+        const records=msg.extra?.zhikuImages,key=recordKey(msg,token),rec=records?.[key];
+        const vs=Array.isArray(rec?.versions)?rec.versions:[];
+        const target=vs[verIdx];
+        if(!target?.url)return;
+        const prevUrl=rec.url,prevPrompt=rec.prompt;
+        rec.url=target.url;if(target.prompt!=null)rec.prompt=target.prompt;
+        freshResults.add(key);
+        try{await context().saveChat();}catch(e){freshResults.delete(key);rec.url=prevUrl;rec.prompt=prevPrompt;notify(e?.message||String(e),'error');return;}
+        decorate(id);
+    }
+    async function deleteMarkerAndResult(id,msg,token){
+        if(pending.has(msg))throw new Error('请等本楼生成结束');
+        if(context().chat?.[id]!==msg)throw new Error('聊天已变化，请重新操作');
+        const source=String(msg.mes||''),swipe=msg.swipe_id;
+        let cut=token.index;
+        if(source.slice(cut,cut+token.raw.length)!==token.raw)cut=source.indexOf(token.raw);
+        if(cut<0)throw new Error('找不到对应的生图标记');
+        const next=(source.slice(0,cut)+source.slice(cut+token.raw.length)).replace(/\n{3,}/g,'\n\n');
+        const swipes=Array.isArray(msg.swipes)&&Number.isInteger(swipe)?msg.swipes:null,oldSwipe=swipes?.[swipe];
+        const records=msg.extra?.zhikuImages,key=recordKey(msg,token),oldRec=records?.[key];
+        msg.mes=next;if(swipes)swipes[swipe]=next;
+        if(records&&oldRec)delete records[key];
+        try{
+            await context().saveChat();
+            guardChatScroll(doc);
+            context().updateMessageBlock(id,msg);
+            decorate(id);
+        }catch(e){
+            msg.mes=source;if(swipes)swipes[swipe]=oldSwipe;
+            if(records&&oldRec)records[key]=oldRec;
+            throw e;
+        }
+    }
     function openImageViewer(src, actions = []) {
         const back=doc.createElement('div'),stage=doc.createElement('div'),img=doc.createElement('img'),bar=doc.createElement('div');
         back.className='pc-image-preview pc-lightbox';
@@ -4553,19 +5013,29 @@ function createMarkerController({context,getData,generate,upload,notify,expandPr
         ]);
     }
     function editPrompt(id,msg,token,index){
-        const source=msg.mes,swipe=msg.swipe_id,{box,dismiss}=dialog(),input=doc.createElement('textarea'),send=doc.createElement('button'),remove=doc.createElement('button');
-        input.value=token.prompt;input.rows=6;send.type=remove.type='button';send.textContent='生成图片';remove.textContent='删除当前图片';
+        const source=msg.mes,swipe=msg.swipe_id,{box,dismiss}=dialog();
+        box.classList.add('pc-c-panel');
+        const close=box.firstChild;
+        if(close&&close.tagName==='BUTTON'){close.className='pc-c-close';close.textContent='收起';}
+        const mk=(tag,cls,text)=>{const e=doc.createElement(tag);if(cls)e.className=cls;if(text!=null)e.textContent=text;if(tag==='button')e.type='button';return e;};
+        const head=mk('div','pc-c-head','修改提示词');
+        const labelEl=mk('div','pc-c-label','提示词内容');
+        const input=doc.createElement('textarea');input.value=token.prompt;input.rows=6;input.spellcheck=false;
+        const record=msg.extra?.zhikuImages?.[recordKey(msg,token)];if(record?.prompt)input.value=record.prompt;
+        const send=mk('button','pc-c-btn','按这个出图');
+        const remove=mk('button','pc-c-btn danger','仅删图片');
         send.onclick=async()=>{
             if(pending.has(msg))return;
             if(context().chat?.[id]!==msg||msg.mes!==source||msg.swipe_id!==swipe){notify('消息已变化，请重新打开编辑','info');return;}
             const prompt=input.value.trim();if(!prompt)return;
-            // Keep the original marker and attach the edited prompt to the generated result.
             dismiss();await process(id,{manual:true,tokenIndex:index,promptOverride:prompt});
         };
-        const record=msg.extra?.zhikuImages?.[recordKey(msg,token)];if(record?.prompt)input.value=record.prompt;
-        remove.disabled=!record;
+        remove.disabled=!record?.url;
         remove.onclick=async()=>{try{await deleteResult(id,msg,token);dismiss();}catch(e){notify(e.message,'error');}};
-        box.append(input,send,remove);
+        const acts=mk('div','pc-c-actions');
+        if(record?.url)acts.append(remove);
+        acts.append(send);
+        box.append(head,labelEl,input,acts);
     }
     function decorateImages(id,msg,scope) {
         const imgs=scope?scope.querySelectorAll('img:is(.pc-chat-img,.custom-pc-chat-img)'):doc.querySelectorAll(`.mes[mesid="${Number(id)}"] .mes_text img:is(.pc-chat-img,.custom-pc-chat-img)`);
@@ -4647,7 +5117,9 @@ function createMarkerController({context,getData,generate,upload,notify,expandPr
                     const {url}=await upload(image,'marker_'+Date.now());if(!current())return 0;
                     if(!url)throw new Error('图片上传未返回地址');
                     const hadExtra=!!msg.extra;msg.extra ||= {};const hadRecords=!!msg.extra.zhikuImages,records=msg.extra.zhikuImages ||= {},old=records[key];
-                    freshResults.add(key);records[key]={url:String(url),prompt:recordPrompt};
+                    const prevVersions=Array.isArray(old?.versions)?old.versions.slice():(old?.url?[{url:old.url,prompt:old.prompt||'',at:0}]:[]);
+                    const nextVersions=[...prevVersions.filter(v=>v?.url&&v.url!==String(url)),{url:String(url),prompt:recordPrompt,at:Date.now()}].slice(-10);
+                    freshResults.add(key);records[key]={url:String(url),prompt:recordPrompt,versions:nextVersions};
                     try{await c.saveChat();}catch(e){freshResults.delete(key);if(old)records[key]=old;else delete records[key];if(!hadRecords&&!Object.keys(records).length)delete msg.extra.zhikuImages;if(!hadExtra&&!Object.keys(msg.extra).length)delete msg.extra;throw e;}
                     failed.get(msg)?.delete(key);
                     notify(reuse?'已插入流式预生成图片':'图片生成完成','success');
@@ -4811,6 +5283,8 @@ async function refreshQuota(force = false) {
     }
     syncQuotaBadge();
 }
+const pcHist = createHistoryStore({ idb: P.indexedDB || globalThis.indexedDB, maxItems: 2000 });
+void pcHist.load().then(() => { if (ui.view === 'studio' && root?.isConnected) render(); });
 function render() {
     if (!root) return;
     const d = getData();
@@ -5047,6 +5521,15 @@ function viewStudio(d) {
         ${st.sceneEn ? `<label class="pc-label">AI 转好的（实际发这段，可以直接改）</label>
         <textarea class="pc-textarea small mono" data-bind="studio.sceneEn">${esc(st.sceneEn)}</textarea>` : ''}
       </div>`)}
+    ${fold('history', '历史生图（独立本地存储）', pcHist.count() ? `已存 ${pcHist.count()} 条 · 不占主存档` : '还没有记录', `
+      <div class="pc-hint" style="margin-top:0">历史生图独立存在浏览器 IndexedDB 中（最多 2000 条），不会撑大画师库主存档。</div>
+      ${pcHist.count() ? `<div class="pc-actions wrap pc-mt-s"><button class="pc-pill dashed tiny danger" data-act="histclear">清空历史</button></div>
+      <div class="pc-grid2 pc-mt-s">${pcHist.all().slice(0, 30).map(h => `<article class="pc-ticket" style="padding-bottom:8px">
+        <div class="pc-ticket-img"><img src="${esc(h.image)}" loading="lazy" alt="" data-act="viewimg" data-src="${esc(h.image)}"></div>
+        <div class="pc-ticket-text"><small>${esc(h.size || '')}${h.seed ? ' · ' + esc(String(h.seed)) : ''}</small></div>
+        <div class="pc-actions wrap" style="padding:0 8px"><button class="pc-pill dashed tiny" data-act="histuse" data-id="${esc(h.id)}">复用提示词</button><button class="pc-pill dashed tiny danger" data-act="histdel" data-id="${esc(h.id)}">删</button></div>
+      </article>`).join('')}</div>` : '<div class="pc-dim small pc-mt-s">在生图页生成图片后会自动记录在这里。</div>'}
+    `)}
     ${fold('extra', '自动加的词', `质量词 ${pv.aqt ? '开' : '关'} · 负面预设 ${(ucpOptions(s).find(o => o[0] === ucpVal) || [0, '自定义'])[1].replace(/（.*）/, '')}`, `
       <label class="pc-switch"><input type="checkbox" data-aqt ${String(s.AQT_novelai ?? '') !== '' ? 'checked' : ''}><span></span>质量词（加在正面最后）<small>${pv.aqt ? esc(pv.aqt) : '现在不加'}</small></label>
       <label class="pc-field"><span>负面预设（加在负面最前面）</span>
@@ -6101,6 +6584,8 @@ function viewCharEdit(d) {
       <div class="pc-hint">生图标记里写 $名字$ 或别名，会展开成上面「固定外貌」那一串。</div>
       <label class="pc-field"><span>描述 nl（英文自然语言，可空）</span><textarea class="pc-textarea small" data-charnl rows="2" placeholder="a girl with long black hair and blue eyes">${esc(c.nl || '')}</textarea></label>
       <div class="pc-hint">只用于 JSON 标记：接在该角色 caption 的 tag 之后、AI 写的 nl 之前；纯文本 $名字$ 只展开 tag，不带描述。</div>
+      <label class="pc-field pc-mt-s"><span>NSFW 身体（仅 NSFW 图发送，可空）</span><textarea class="pc-textarea small mono" data-charnsfwbody rows="2" placeholder="medium breasts, pink nipples, shaved pussy">${esc(c.nsfwBody || '')}</textarea></label>
+      <div class="pc-hint">只在 NSFW / explicit / nude 等画面里自动并入该角色；SFW 画面不会发送。画面含 nude/naked/topless 时也会自动跳过「固定穿一套」的衣服。</div>
     </section>
     <details class="pc-fold"><summary><b>不想出现的</b><i>${esc(c.negative) || '这个角色专用的负面词'}</i></summary><div class="pc-fold-in">
       <textarea class="pc-textarea small mono" data-charneg placeholder="比如 beard, glasses">${esc(c.negative)}</textarea></div></details>
@@ -6864,7 +7349,7 @@ function viewSettings(d) {
       <div class="pc-hint" style="margin-top:0">画师库存在酒馆的 user/files/piaoce_data.json，例图在 user/images/piaoce/，换设备也在。</div>
       <div class="pc-actions wrap">
         ${zSettings() ? '<button class="pc-btn" data-act="importfixed">从智绘姬搬过来</button>' : ''}
-        <button class="pc-btn" data-act="exportdata">导出</button>
+        <button class="pc-btn" data-act="diagstorage">检查画师库存档</button><button class="pc-btn" data-act="exportdata">导出</button>
         <label class="pc-btn">导入<input type="file" accept=".json,application/json" data-importdata hidden></label>
       </div>`);
 
@@ -7016,6 +7501,27 @@ async function onClick(ev, outside = false) {
                 break;
             }
             case 'clearresult': ui.studio.result = null; ui.studio.sent = null; render(); break;
+            case 'histuse': {
+                const h = pcHist.all().find(x => x.id === el.dataset.id);
+                if (!h) break;
+                if (h.prompt) ui.studio.pos = h.prompt;
+                if (h.negative) ui.studio.neg = h.negative;
+                saveStudio(); render();
+                toastr.success('已填入生图页提示词', '历史生图', { timeOut: 1800 });
+                break;
+            }
+            case 'histdel': {
+                await pcHist.remove(el.dataset.id);
+                render();
+                break;
+            }
+            case 'histclear': {
+                if (!(await confirmBox(`清空全部 ${pcHist.count()} 条本地历史生图记录？`, { ok: '清空', cancel: '算了' }))) break;
+                await pcHist.clear();
+                render();
+                toastr.info('已清空历史生图', '智库', { timeOut: 1800 });
+                break;
+            }
             case 'ucp-saveas': {
                 const ns = N.settings();
                 const cur = findUcpPreset(ns.UCP_presets, ns.UCP_novelai);
@@ -7270,6 +7776,7 @@ async function onClick(ev, outside = false) {
                 render();
                 break;
             }
+            case 'diagstorage': await confirmBox(__mod_store.diagnoseStorage(), { ok: '知道了', cancel: '关闭' }); break;
             case 'exportdata': exportData(); break;
             case 'saveresult': await saveStudioResult(); break;
             case 'insertresult':
@@ -7520,6 +8027,7 @@ function onInput(ev) {
     }
     if (el.dataset.charaliases !== undefined) { const c = C.getChar(ui.charKey); if (c) { c.aliases = splitAliases(el.value); C.saveChar(c); } return; }
     if (el.dataset.charnl !== undefined) { const c = C.getChar(ui.charKey); if (c) { c.nl = el.value.trim(); C.saveChar(c); } return; }
+    if (el.dataset.charnsfwbody !== undefined) { const c = C.getChar(ui.charKey); if (c) { c.nsfwBody = el.value.trim(); C.saveChar(c); } return; }
     if (el.dataset.charneg !== undefined) { const c = C.getChar(ui.charKey); if (c) { c.negative = el.value; C.saveChar(c); } return; }
     if (el.dataset.tparam) {
         const [t, id] = el.dataset.tparam.split(':'), it = (t === 'group' ? d.groups : d.artists)[id], k = el.dataset.field;
@@ -7704,6 +8212,7 @@ async function doGenerate() {
     try {
         st.result = await E.generate(studioParts());
         st.sent = E.runtime.lastSent;
+        if (st.result) void pcHist.add({ image: st.result, prompt: st.sent?.prompt || st.pos, negative: st.sent?.negative || st.neg, size: st.sent?.size || '', seed: st.sent?.seed ?? '', source: 'studio' });
     } catch (e) {
         toastr.error(e.message, '生成失败', { timeOut: 8000 });
     } finally {
@@ -8615,6 +9124,11 @@ async function start() {
         if (chatTimer !== null) clearTimeout(chatTimer);
         chatTimer = setTimeout(() => { chatTimer = null; __mod_chars.invalidateCharState(); UI.renderChip(); UI.renderStub(); E.applyBindingOnChatChange(); scheduleMesButtons(); }, 250);
     };
+    const onVisHide = () => { if (DOC.visibilityState === 'hidden') void __mod_store.flush(); };
+    const onPageHide = () => { void __mod_store.flush(); };
+    DOC.addEventListener('visibilitychange', onVisHide);
+    P.addEventListener?.('pagehide', onPageHide);
+    cleanups.push(() => { DOC.removeEventListener('visibilitychange', onVisHide); P.removeEventListener?.('pagehide', onPageHide); });
     DOC.addEventListener('click', onChatClick, true);
     cleanups.push(() => {
         if (chatTimer !== null) clearTimeout(chatTimer);

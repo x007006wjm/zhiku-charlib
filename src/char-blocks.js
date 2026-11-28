@@ -429,6 +429,7 @@ export function normalizeChatEntry(raw) {
         outfits,
         outfitId,
         negative: typeof raw.negative === 'string' ? raw.negative.trim() : '',
+        nsfwBody: typeof raw.nsfwBody === 'string' ? raw.nsfwBody.trim() : '',
         source: raw.source === 'ai' ? 'ai' : 'manual',
         history: normalizeHistory(raw.history),
     };
@@ -459,6 +460,7 @@ export function entryFromGlobal(character) {
         outfits: character?.outfits,
         outfitId: character?.outfitId,
         negative: character?.negative,
+        nsfwBody: character?.nsfwBody,
         source: 'manual',
         history: [],
     });
@@ -477,6 +479,7 @@ export function globalFromChatEntry(entry) {
         outfits: normalized.outfits,
         outfitId: normalized.outfitId,
         negative: normalized.negative || '',
+        nsfwBody: normalized.nsfwBody || '',
         charRef: '',
     };
 }
@@ -501,6 +504,7 @@ export function mergeCharacterLayers(chatEntry, globalChar) {
         outfits: normalizeOutfits(globalChar.outfits),
         outfitId: String(globalChar.outfitId ?? ''),
         negative: typeof globalChar.negative === 'string' ? globalChar.negative.trim() : '',
+        nsfwBody: typeof globalChar.nsfwBody === 'string' ? globalChar.nsfwBody.trim() : '',
         charRef: String(globalChar.charRef ?? ''),
     };
     const useChatAppearance = chat.appearance.length > 0;
@@ -517,6 +521,7 @@ export function mergeCharacterLayers(chatEntry, globalChar) {
         outfits: useChatOutfit ? chat.outfits : global.outfits,
         outfitId: useChatOutfit ? chat.outfitId : (global.outfitId || global.outfits[0]?.id || ''),
         negative: chat.negative || global.negative,
+        nsfwBody: chat.nsfwBody || global.nsfwBody,
         charRef: chat.charRef || global.charRef,
     };
     return {
