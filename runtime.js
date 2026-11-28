@@ -178,7 +178,7 @@ function deleteUcpPreset(presets, id) {
     return normalizeUcpPresets(presets).filter(p => p.id !== target);
 }
 
-// 智库 · 原生扩展版 v0.8.17（二改自从前佬的智绘姬）
+// 智库 · 原生扩展版 v0.8.18（二改自从前佬的智绘姬）
 // 不需要智绘姬，填 NovelAI key 就能用。
 // NovelAI 请求格式参考了智绘姬（作者：从前跟你一样，https://github.com/damoshen123/st-chatu8，AFPL v9）。
 const P = (() => { try { if (window.parent && window.parent !== window && window.parent.document) return window.parent; } catch (e) { /* 跨域 */ } return window; })();
@@ -196,7 +196,7 @@ const __shim = {
     get extension_settings() { return __ctx().extensionSettings; },
 };
 
-globalThis.__PC_VERSION = '0.8.17';
+globalThis.__PC_VERSION = '0.8.18';
 
 // ───── model.js ─────
 const __mod_model = (() => {
@@ -879,7 +879,7 @@ async function call(path, { method = 'GET', body } = {}) {
     });
     let json = null;
     try { json = await res.json(); } catch { /* 空响应 */ }
-    if (!res.ok) throw new Error(json?.error || `HTTP ${res.status}`);
+    if (!res.ok) throw Object.assign(new Error(json?.error || `HTTP ${res.status}`), { status: res.status });
     return json;
 }
 
@@ -893,9 +893,10 @@ const createPost = body => call('/lobby/posts', { method: 'POST', body: { nickna
 const likePost = id => call(`/lobby/posts/${id}/like`, { method: 'POST' });
 const copyPost = id => call(`/lobby/posts/${id}/copy`, { method: 'POST' });
 const reportPost = id => call(`/lobby/posts/${id}/report`, { method: 'POST' });
+const updatePost = (id, body) => call(`/lobby/posts/${id}`, { method: 'PATCH', body: { nickname: getData().lobby.nickname, ...body } });
 const deletePost = id => call(`/lobby/posts/${id}`, { method: 'DELETE' });
 
-return { serverBase, lobbyImgUrl, health, listPosts, listTags, createPost, likePost, copyPost, reportPost, deletePost };
+return { serverBase, lobbyImgUrl, health, listPosts, listTags, createPost, updatePost, likePost, copyPost, reportPost, deletePost };
 })();
 
 // ───── nai.js ─────
@@ -6204,7 +6205,7 @@ function openLobbySheet(p) {
       ${p.note ? `<p class="pc-quote small">${esc(p.note)}</p>` : ''}
       <div class="pc-chips wrap">${p.tags.map(t => `<span class="pc-tagchip ${t === 'NSFW' ? 'nsfw' : ''}">${esc(t)}</span>`).join('')}</div>
       <div class="pc-actions wrap">
-        ${p.mine ? `<button class="pc-btn danger" data-act="lobbydel" data-id="${p.id}">删除</button>` : `<button class="pc-btn" data-act="lobbyreport" data-id="${p.id}">举报</button>`}
+        ${p.mine ? `${(p.kind === 'artist' || p.kind === 'group') ? `<button class="pc-btn" data-act="lobbyedit" data-id="${p.id}">编辑</button>` : ''}<button class="pc-btn danger" data-act="lobbydel" data-id="${p.id}">删除</button>` : `<button class="pc-btn" data-act="lobbyreport" data-id="${p.id}">举报</button>`}
         <button class="pc-btn" data-act="lobbylike" data-id="${p.id}">♡ ${p.likes}</button>
         <button class="pc-btn dark" data-act="lobbycopy" data-id="${p.id}">${p.copied ? '已保存' : '保存到我的' + (p.kind === 'character' || p.kind === 'outfit' ? '角色' : '智库')}</button>
       </div></section>`;
@@ -6232,7 +6233,7 @@ function lobbyCard(p) {
       <div class="pc-lobby-img" ${img ? `data-act="viewimg" data-src="${esc(L.lobbyImgUrl(img.url))}"` : ''}>${img ? `<img src="${esc(L.lobbyImgUrl(img.url))}" loading="lazy" alt="">` : '<span>无图</span>'}${p.images.length > 1 ? `<em>+${p.images.length - 1}</em>` : ''}</div>
       <div class="pc-lobby-text">
         <div class="pc-row-between"><span class="pc-label">${esc(p.nickname)} · ${KIND_NAME[p.kind] || p.kind}</span>
-          ${p.mine ? `<button class="pc-icon-btn small" data-act="lobbydel" data-id="${p.id}" aria-label="删除我分享的">×</button>` : `<button class="pc-icon-btn small" data-act="lobbyreport" data-id="${p.id}" aria-label="举报">${ICON.flag}</button>`}</div>
+          ${p.mine ? `<span style="display:inline-flex;gap:4px">${(p.kind === 'artist' || p.kind === 'group') ? `<button class="pc-icon-btn small" data-act="lobbyedit" data-id="${p.id}" aria-label="编辑我分享的" title="编辑">✎</button>` : ''}<button class="pc-icon-btn small" data-act="lobbydel" data-id="${p.id}" aria-label="删除我分享的">×</button></span>` : `<button class="pc-icon-btn small" data-act="lobbyreport" data-id="${p.id}" aria-label="举报">${ICON.flag}</button>`}</div>
         <b>${esc(p.name)}</b>
         <small>${esc(p.note || p.content?.artistString || '')}</small>
         <div class="pc-chips wrap tiny">${p.tags.map(t => `<span class="pc-tagchip ${t === 'NSFW' ? 'nsfw' : ''}">${esc(t)}</span>`).join('')}</div>
@@ -6902,6 +6903,11 @@ async function onClick(ev, outside = false) {
                 toastr.info('已举报', '共享');
                 break;
             }
+            case 'lobbyedit': {
+                const post = ui.lobby.items.find(x => x.id === el.dataset.id);
+                if (post) openSharedUpload(post);
+                break;
+            }
             case 'lobbydel': {
                 if (!(await confirmBox('删除你分享的这一条？'))) break;
                 await L.deletePost(el.dataset.id);
@@ -7283,24 +7289,33 @@ async function readImagePrompt(file) {
     return r;
 }
 
-function openSharedUpload() {
+function openSharedUpload(editing = null) {
     const d = getData();
+    const isEdit = Boolean(editing && editing.id);
+    const initTitle = isEdit ? String(editing.name || '') : '';
+    const initSig = isEdit ? String(editing.nickname || d.lobby.nickname || '') : String(d.lobby.nickname || '');
+    const initPos = isEdit ? String(editing.content?.artistString || '') : '';
+    const initNeg = isEdit ? String(editing.content?.negative || '') : '';
+    const initTags = isEdit ? (editing.tags || []).filter(t => t !== 'NSFW').join(', ') : '';
+    const initNote = isEdit ? String(editing.note || '') : '';
+    const initNsfw = isEdit ? Boolean(editing.nsfw || (editing.tags || []).includes('NSFW')) : false;
+    let keptImages = isEdit ? (editing.images || []).map(i => ({ url: i.url, nsfw: !!i.nsfw })) : [];
     const box = modal(`<form data-share-form>
-      <h3 class="pc-h3">上传画师串</h3>
-      <label class="pc-field"><span>名称</span><input class="pc-input" name="title" maxlength="200" required placeholder="给这串起个名字"></label>
-      <label class="pc-field"><span>署名</span><input class="pc-input" name="signature" maxlength="24" required value="${esc(d.lobby.nickname || '')}" placeholder="显示在共享卡片上的名字"></label>
+      <h3 class="pc-h3">${isEdit ? '编辑已上传的画师串' : '上传画师串'}</h3>
+      <label class="pc-field"><span>名称</span><input class="pc-input" name="title" maxlength="200" required value="${esc(initTitle)}" placeholder="给这串起个名字"></label>
+      <label class="pc-field"><span>署名</span><input class="pc-input" name="signature" maxlength="24" required value="${esc(initSig)}" placeholder="显示在共享卡片上的名字"></label>
       <div class="pc-field"><span>例图（可选，最多 6 张）</span><label class="pc-pill dashed pc-share-pick">＋ 选图<input name="images" type="file" accept="image/png,image/jpeg,image/webp" multiple hidden></label>
-        <small class="pc-dim" style="display:block;margin-top:4px">选 NovelAI 原图，会自动读出正面和负面填到下面</small></div>
+        <small class="pc-dim" style="display:block;margin-top:4px">${isEdit ? '已保留原例图（点缩略图右上角 × 可移除），也可继续补选新图' : '选 NovelAI 原图，会自动读出正面和负面填到下面'}</small></div>
       <div data-share-previews style="display:flex;gap:8px;flex-wrap:wrap;margin:8px 0"></div>
       <button class="pc-pill dashed" type="button" data-share-clear hidden>清空例图</button>
       <p class="pc-dim small" data-share-meta role="status" aria-live="polite"></p>
-      <label class="pc-field"><span>画师串（正面）</span><textarea class="pc-textarea mono" name="artistString" maxlength="20000" required placeholder="artist:aaa, 0.8::artist:bbb::"></textarea></label>
-      <label class="pc-field"><span>负面（可选）</span><textarea class="pc-textarea mono" name="negative" maxlength="20000" placeholder="lowres, bad anatomy …"></textarea></label>
-      <label class="pc-field"><span>标签（可选，逗号隔开）</span><input class="pc-input" name="tags" maxlength="800" placeholder="BL, 厚涂, 柔和"></label>
-      <label class="pc-field"><span>说明（可选）</span><textarea class="pc-textarea" name="note" maxlength="5000" placeholder="适合的画面、使用建议或来源"></textarea></label>
-      <label class="pc-switch"><input type="checkbox" name="nsfw"><span></span>含 NSFW 内容</label>
+      <label class="pc-field"><span>画师串（正面）</span><textarea class="pc-textarea mono" name="artistString" maxlength="20000" required placeholder="artist:aaa, 0.8::artist:bbb::">${esc(initPos)}</textarea></label>
+      <label class="pc-field"><span>负面（可选）</span><textarea class="pc-textarea mono" name="negative" maxlength="20000" placeholder="lowres, bad anatomy …">${esc(initNeg)}</textarea></label>
+      <label class="pc-field"><span>标签（可选，逗号隔开）</span><input class="pc-input" name="tags" maxlength="800" value="${esc(initTags)}" placeholder="BL, 厚涂, 柔和"></label>
+      <label class="pc-field"><span>说明（可选）</span><textarea class="pc-textarea" name="note" maxlength="5000" placeholder="适合的画面、使用建议或来源">${esc(initNote)}</textarea></label>
+      <label class="pc-switch"><input type="checkbox" name="nsfw" ${initNsfw ? 'checked' : ''}><span></span>含 NSFW 内容</label>
       <p class="pc-dim small" data-share-status role="status" aria-live="polite"></p>
-      <div class="pc-actions"><button class="pc-btn" type="button" data-share-cancel>取消</button><button class="pc-btn dark" type="submit">发布到共享</button></div>
+      <div class="pc-actions"><button class="pc-btn" type="button" data-share-cancel>取消</button><button class="pc-btn dark" type="submit">${isEdit ? '保存修改' : '发布到共享'}</button></div>
     </form>`);
     box.style.maxHeight = '90dvh';
     box.style.overflowY = 'auto';
@@ -7316,6 +7331,35 @@ function openSharedUpload() {
     let busy = false, previewVersion = 0;
     const say = message => { status.textContent = message; };
     const metaBox = box.querySelector('[data-share-meta]');
+    const renderPreviews = async version => {
+        previews.replaceChildren();
+        const total = keptImages.length + files.files.length;
+        clear.hidden = total === 0;
+        keptImages.forEach((item, idx) => {
+            const wrap = DOC.createElement('div');
+            wrap.style.cssText = 'position:relative;width:72px;height:88px';
+            const img = DOC.createElement('img');
+            img.src = L.lobbyImgUrl(item.url); img.alt = '原例图';
+            img.style.cssText = 'width:72px;height:88px;object-fit:cover;border-radius:8px;display:block';
+            const del = DOC.createElement('button');
+            del.type = 'button'; del.textContent = '×'; del.title = '移除这张原例图';
+            del.style.cssText = 'position:absolute;top:2px;right:2px;width:20px;height:20px;border-radius:50%;border:none;background:rgba(0,0,0,.68);color:#fff;cursor:pointer;line-height:1;padding:0;font-size:13px';
+            del.addEventListener('click', () => { if (busy) return; keptImages.splice(idx, 1); void renderPreviews(++previewVersion); });
+            wrap.append(img, del);
+            previews.appendChild(wrap);
+        });
+        if (total > 6) { say('例图总数最多 6 张，请移除多余图片或重新选择。'); return; }
+        say('');
+        for (const file of files.files) {
+            if (!['image/png', 'image/jpeg', 'image/webp'].includes(file.type) || file.size > 20 * 1024 * 1024) { say('请选择 20MB 以内的 PNG、JPEG 或 WebP 图片。'); return; }
+            try {
+                const src = await shrinkDataUrl(await fileToDataUrl(file), 240, 0.75);
+                if (version !== previewVersion || !box.isConnected) return;
+                const img = DOC.createElement('img'); img.src = src; img.alt = file.name;
+                img.style.cssText = 'width:72px;height:88px;object-fit:cover;border-radius:8px'; previews.appendChild(img);
+            } catch { say('有一张例图无法读取，请重新选择。'); }
+        }
+    };
     const fillFromImageMeta = async version => {
         let meta = null;
         for (const file of files.files) {
@@ -7334,25 +7378,22 @@ function openSharedUpload() {
         b.addEventListener('click', apply);
         metaBox.appendChild(b);
     };
-    clear.addEventListener('click', () => { ++previewVersion; files.value = ''; previews.replaceChildren(); metaBox.replaceChildren(); clear.hidden = true; say(''); });
+    clear.addEventListener('click', () => { ++previewVersion; keptImages = []; files.value = ''; previews.replaceChildren(); metaBox.replaceChildren(); clear.hidden = true; say(''); });
     files.addEventListener('change', async () => {
         const version = ++previewVersion;
-        previews.replaceChildren(); clear.hidden = !files.files.length;
-        if (files.files.length > 6) { say('最多选择 6 张例图，请重新选择。'); return; }
-        say('');
-        for (const file of files.files) {
-            if (!['image/png', 'image/jpeg', 'image/webp'].includes(file.type) || file.size > 20 * 1024 * 1024) { say('请选择 20MB 以内的 PNG、JPEG 或 WebP 图片。'); return; }
-            try {
-                const src = await shrinkDataUrl(await fileToDataUrl(file), 240, 0.75);
-                if (version !== previewVersion || !box.isConnected) return;
-                const img = DOC.createElement('img'); img.src = src; img.alt = file.name;
-                img.style.cssText = 'width:72px;height:88px;object-fit:cover;border-radius:8px'; previews.appendChild(img);
-            } catch { say('有一张例图无法读取，请重新选择。'); }
-        }
+        await renderPreviews(version);
         if (version === previewVersion && box.isConnected) await fillFromImageMeta(version);
     });
+    if (keptImages.length) void renderPreviews(++previewVersion);
     box.querySelector('[data-share-cancel]').addEventListener('click', () => { if (!busy) box.closeModal(); });
     box.parentElement.addEventListener('click', ev => { if (busy && ev.target === box.parentElement) ev.stopImmediatePropagation(); }, true);
+    const submitCreate = async (post, note, negative, artistString, members) => {
+        try { await L.createPost(post); }
+        catch (e) {
+            if (!negative || [401, 403, 413, 429].includes(e?.status)) throw e;
+            await L.createPost({ ...post, note: [note, '负面：' + negative].filter(Boolean).join('\n\n').slice(0, 5000), content: { artistString, members } });
+        }
+    };
     form.addEventListener('submit', async ev => {
         ev.preventDefault();
         if (busy) return;
@@ -7361,8 +7402,8 @@ function openSharedUpload() {
         const { members } = M.parseArtistString(artistString);
         if (!name || !nickname) { say('请填写名称和署名。'); return; }
         if (!members.length) { say('请填写带 artist: 的画师串，例如 artist:aaa。'); return; }
-        if (files.files.length > 6) { say('最多选择 6 张例图。'); return; }
         const selected = Array.from(files.files);
+        if (keptImages.length + selected.length > 6) { say('例图总数最多 6 张，请先移除几张。'); return; }
         if (selected.some(f => !['image/png', 'image/jpeg', 'image/webp'].includes(f.type) || f.size > 20 * 1024 * 1024)) { say('请选择 20MB 以内的 PNG、JPEG 或 WebP 图片。'); return; }
         const nsfw = form.elements.namedItem('nsfw').checked;
         const tags = value('tags').split(/[,，\n]/).map(s => s.trim()).filter(Boolean);
@@ -7371,19 +7412,36 @@ function openSharedUpload() {
         Array.from(form.elements).forEach(el => { el.disabled = true; });
         try {
             const images = [];
+            for (let i = 0; i < keptImages.length; i++) {
+                say(`正在保留原例图 ${i + 1}/${keptImages.length}…`);
+                const rawUrl = await urlToDataUrl(L.lobbyImgUrl(keptImages[i].url));
+                const data = await shrinkDataUrl(rawUrl, 1024, 0.85);
+                images.push({ data, nsfw });
+            }
             for (let i = 0; i < selected.length; i++) {
-                say(`正在处理例图 ${i + 1}/${selected.length}…`);
+                say(`正在处理新例图 ${i + 1}/${selected.length}…`);
                 const data = await shrinkDataUrl(await fileToDataUrl(selected[i]), 1024, 0.85);
                 if ((data.split(',')[1]?.length || 0) * 0.75 > 1024 * 1024) throw new Error('例图压缩后仍超过 1MB，请换一张较小的图片。');
                 images.push({ data, nsfw });
             }
-            say('正在发布…');
             const post = { nickname, name, kind: members.length === 1 ? 'artist' : 'group', note, tags, nsfw, content: { artistString, members, ...(negative ? { negative } : {}) }, images };
-            try { await L.createPost(post); }
-            catch (e) {
-                // 服务器不认负面字段时，把负面写进说明再发一次
-                if (!negative || [401, 403, 413, 429].includes(e?.status)) throw e;
-                await L.createPost({ ...post, note: [note, '负面：' + negative].filter(Boolean).join('\n\n').slice(0, 5000), content: { artistString, members } });
+            if (isEdit) {
+                say('正在保存修改…');
+                let patched = false;
+                try {
+                    await L.updatePost(editing.id, post);
+                    patched = true;
+                } catch (e) {
+                    if ([401, 403, 413, 429].includes(e?.status)) throw e;
+                }
+                if (!patched) {
+                    say('正在重新发布并替换旧条目…');
+                    await submitCreate(post, note, negative, artistString, members);
+                    try { await L.deletePost(editing.id); } catch (e) { console.warn('[智库] 删除旧共享条目失败', e); }
+                }
+            } else {
+                say('正在发布…');
+                await submitCreate(post, note, negative, artistString, members);
             }
             d.lobby.nickname = nickname;
             if (nsfw) d.options.lobbyShowNsfw = true;
@@ -7392,16 +7450,14 @@ function openSharedUpload() {
             Object.assign(ui.lobby, { mine: true, q: '', tag: '', tag2: '', kind: '', sort: 'new' });
             ui.view = 'lobby';
             await loadLobby();
-            toastr.success('已发布到共享', '智库');
+            toastr.success(isEdit ? '已更新共享画师串' : '已发布到共享', '智库');
         } catch (e) {
-            say(e.message || '上传失败，请重试');
-        } finally {
+            say(e.message || (isEdit ? '保存失败，请稍后再试。' : '发布失败，请稍后再试。'));
             busy = false;
             Array.from(form.elements).forEach(el => { el.disabled = false; });
         }
     });
 }
-
 
 async function shareToLobby(ref) {
     const d = getData();

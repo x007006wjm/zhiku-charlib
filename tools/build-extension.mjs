@@ -324,7 +324,7 @@ return { serverBase, lobbyImgUrl, health, listPosts, listTags, createPost, updat
             case 'lobbydel': {`);
     {
         const startIdx = s.indexOf('function openSharedUpload() {');
-        const endIdx = s.indexOf('\nfunction openRegister(', startIdx);
+        const endIdx = s.indexOf('\nasync function shareToLobby(', startIdx);
         assert(startIdx > 0 && endIdx > startIdx, 'openSharedUpload block');
         patch(s.slice(startIdx, endIdx), `function openSharedUpload(editing = null) {
     const d = getData();
